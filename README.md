@@ -1,0 +1,129 @@
+# 度规涌现模型 (Metric Emergence Model)
+
+一个基于微分几何的神经网络架构，从数据中自动涌现黎曼度规，用几何结构预测时序演化。
+
+## 文件说明
+
+> **核心模型**: `evolution/model.py`  
+> **外推测试**: `evolution/test_extrapolation.py`  
+> **泛化测试**: `evolution/test_generalization.py`  
+> **训练规则**: `evolution/train_rules.py`
+
+## 核心思想
+
+```
+data → z → g(z) → Γ → a_geodesic + F_external → prediction
+```
+
+- **状态编码**: 将输入数据映射到隐空间 z
+- **度规涌现**: 从 z 学习黎曼度规 g(z)
+- **测地线加速度**: 通过 Christoffel 符号计算几何加速度
+- **外力补偿**: 小容量外力网络处理非几何效应
+- **几何优先**: 通过惩罚机制迫使模型优先使用几何
+
+## 项目结构
+
+```
+evolution/
+├── model.py                # 核心模型实现 ⭐
+├── test_extrapolation.py   # 外推测试（完整优化版）
+├── test_generalization.py  # 泛化测试
+├── train_rules.py          # 训练规则
+├── train_evolution.py      # 训练脚本
+└── ...
+```
+
+## 快速开始
+
+### 斐波那契外推测试
+
+```python
+from evolution.test_extrapolation import train_and_test
+
+# 训练并测试：给定前5个数，预测后10个数
+result = train_and_test(
+    n_given=5,
+    n_predict=10,
+    epochs=500,
+    z_dim=8,
+    fw_max=15.0,    # 外力惩罚权重
+    ss_max=0.8,     # Scheduled Sampling
+    use_float64=True,
+)
+```
+
+### 多次运行取最佳
+
+```python
+from evolution.test_extrapolation import multi_run
+
+best = multi_run(n_runs=3, epochs=500)
+```
+
+## 实验结果
+
+### 斐波那契数列外推 (前5 → 后10)
+
+| 指标 | 值 |
+|------|-----|
+| 平均误差 | ~0.01 |
+| Step 10 误差 | ~3.5% |
+
+**示例输出:**
+
+```
+外推测试 (归一化模式): 给定 5 个 → 预测 10 个
+给定: ['0.0016', '0.0016', '0.0033', '0.0049', '0.0082']
+
+  Step 1: pred=0.0136, true=0.0131, err=0.0004
+  Step 2: pred=0.0224, true=0.0213, err=0.0011
+  Step 3: pred=0.0368, true=0.0344, err=0.0024
+  Step 4: pred=0.0600, true=0.0557, err=0.0042
+  Step 5: pred=0.0969, true=0.0902, err=0.0068
+  Step 6: pred=0.1556, true=0.1459, err=0.0097
+  Step 7: pred=0.2486, true=0.2361, err=0.0125
+  Step 8: pred=0.3979, true=0.3820, err=0.0160
+  Step 9: pred=0.6421, true=0.6180, err=0.0240
+  Step 10: pred=1.0350, true=1.0000, err=0.0350
+
+统计: 平均误差=0.01
+```
+
+## 核心组件
+
+### MetricEvolutionModel (`evolution/model.py`)
+
+主模型类，包含：
+- `StateEncoder`: 序列 → 隐状态
+- `MetricEncoder`: 隐状态 → 度规张量 g(z)
+- `ChristoffelComputer`: 度规 → Christoffel 符号
+- `ExternalForce`: 受限外力网络
+- `Decoder`: 加速度 → 预测
+
+### 训练策略
+
+1. **动态外力惩罚 (fw)**: 逐渐增加对外力使用的惩罚
+2. **Scheduled Sampling (ss)**: 训练时使用模型自己的预测
+3. **特征值正则化**: 保证度规正定性
+4. **高精度 float64**: 减少累积误差
+
+## 技术细节
+
+### 约束模式 vs 暴论模式
+
+- **约束模式** (`unconstrained=False`): 度规正定，稳定
+- **暴论模式** (`unconstrained=True`): 不定号度规，灵活但不稳定
+
+### 度规涌现原理
+
+模型学习一个从隐空间到度规张量的映射：
+
+```
+g_ij(z) = L(z) @ L(z)^T + ε * I
+```
+
+其中 L(z) 是 Cholesky 分解的下三角矩阵，保证正定性。
+
+## License
+
+Apache-2.0
