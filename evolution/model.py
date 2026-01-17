@@ -294,53 +294,201 @@ class RMSNorm(nn.Module):
 # 感知层：数据 → 抽象状态 → 度规张量 (Perception Layer)
 # =============================================================================
 
-class StateEncoder(nn.Module):
+class DynamicStateEncoder(nn.Module):
     """
-    状态编码器：将原始数据映射到抽象广义坐标 z
+    动力学状态推断网络 (Dynamic State Inference Network)
     
-    z 是 AI 感知到的"你在哪"的内在表示
+    第一性原理设计：
+        一个物理系统的瞬时状态，由其位置及其时间导数共同定义。
+        即使只有几条数据，我们也能（在数值上）估计出这些信息。
     
-    架构特点：
-        - RMSNorm 稳定输出尺度
-        - 残差连接保留信息流
+    核心功能：
+        从极小的观测窗口 [x_{t-W+1}, ..., x_t] 中，直接推断出系统在
+        相空间中的"完整物理状态" z_t = (位置, 速度, 加速度...).
     
-    复杂度: O(L * D)
+    关键创新：
+        1. 非序列化推断：每个 z_t 独立从其自身的 W 长度窗口推断
+        2. 显式导数估计：内部计算数值导数作为先验特征
+        3. 物理意义强：z_dim <= 4 直接对应自由度（位置+速度）
+        4. Tanh 输出：确保 z 在有界范围内，利于几何结构自涌现
+    
+    复杂度: O(W * D) per point, 非串行
+    代数律: z(t+T) ≈ z(t) 对于周期系统（自涌现的闭合轨道）
     """
-    def __init__(self, input_dim: int, z_dim: int):
+    
+    # 观测窗口大小（极小，3-4个点足以估计位置和导数）
+    WINDOW_SIZE: int = 4
+    
+    def __init__(self, input_dim: int, z_dim: int, window_size: int = 4):
         super().__init__()
+        self.input_dim = input_dim
         self.z_dim = z_dim
+        self.window_size = window_size
         
-        # 输入投影
-        self.input_proj = nn.Linear(input_dim, z_dim * 2)
+        # 显式导数特征维度：x, dx, d2x (每个 input_dim 维)
+        # 对于 input_dim=1: 3 个特征
+        derivative_features = input_dim * 3  # (x, dx, d2x)
         
-        # 序列编码（简单的因果卷积）
-        self.conv = nn.Conv1d(z_dim * 2, z_dim, kernel_size=3, padding=2)
+        # 窗口原始值特征
+        window_features = input_dim * window_size
         
-        # 输出投影 + 归一化
-        self.out_proj = nn.Linear(z_dim, z_dim)
-        self.norm = RMSNorm(z_dim)  # 稳定 z 的尺度
+        # 总输入特征 = 窗口原始值 + 显式导数
+        total_features = window_features + derivative_features
+        
+        # 增强的 MLP：从局部窗口推断物理状态
+        # 设计原则：更大容量，让 z 空间真正"动起来"
+        hidden_dim = max(z_dim * 8, 32)  # 增强容量
+        
+        self.state_inferrer = nn.Sequential(
+            nn.Linear(total_features, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, z_dim),
+            # nn.Tanh(),  # 关键：确保 z 在 [-1, 1] 范围，利于几何结构自涌现
+        )
+        
+        # 移除 RMSNorm，让 z 空间更自由地动起来
+        # 不再归一化，允许 z 保持其自然尺度
+        
+        # 初始化：gain=1.0，让模型有足够的表达能力
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Xavier 初始化，gain=1.0"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=1.0)  # 改为 gain=1.0
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def _compute_derivatives(self, window: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        从窗口计算数值导数 - 纯函数
+        
+        使用中心差分（更稳定）和边界单侧差分
+        
+        window: [B, W] 或 [B, W, input_dim]
+        返回: (x_t, dx_t, d2x_t) 当前位置、速度、加速度估计
+        """
+        if window.dim() == 2:
+            window = window.unsqueeze(-1)  # [B, W, 1]
+        
+        B, W, D = window.shape
+        
+        # 当前位置：窗口最后一个点
+        x_t = window[:, -1, :]  # [B, D]
+        
+        # 速度估计：使用最后两个点的差分
+        # dx/dt ≈ (x_t - x_{t-1})
+        if W >= 2:
+            dx_t = window[:, -1, :] - window[:, -2, :]  # [B, D]
+        else:
+            dx_t = torch.zeros_like(x_t)
+        
+        # 加速度估计：使用最后三个点的二阶差分
+        # d²x/dt² ≈ x_{t} - 2*x_{t-1} + x_{t-2}
+        if W >= 3:
+            d2x_t = window[:, -1, :] - 2 * window[:, -2, :] + window[:, -3, :]  # [B, D]
+        else:
+            d2x_t = torch.zeros_like(x_t)
+        
+        return x_t, dx_t, d2x_t
+    
+    def _encode_single_window(self, window: Tensor) -> Tensor:
+        """
+        编码单个窗口到物理状态 - 纯函数
+        
+        window: [B, W, input_dim]
+        返回: z [B, z_dim]
+        """
+        B, W, D = window.shape
+        
+        # 1. 计算显式导数特征
+        x_t, dx_t, d2x_t = self._compute_derivatives(window)
+        derivative_features = torch.cat([x_t, dx_t, d2x_t], dim=-1)  # [B, 3*D]
+        
+        # 2. 窗口原始值特征
+        window_flat = window.reshape(B, -1)  # [B, W*D]
+        
+        # 3. 拼接所有特征
+        features = torch.cat([window_flat, derivative_features], dim=-1)  # [B, W*D + 3*D]
+        
+        # 4. MLP 推断物理状态（输出经过 Tanh，在 [-1, 1] 范围）
+        z = self.state_inferrer(features)  # [B, z_dim]
+        
+        return z
     
     def forward(self, x: Tensor) -> LatentState:
         """
+        从序列推断每个时刻的物理状态
+        
+        关键：每个 z_t 独立从其局部窗口推断，非串行依赖！
+        
         x: [B, L] 或 [B, L, input_dim] 输入序列
-        返回: z [B, L, z_dim] 广义坐标
+        返回: z [B, L, z_dim] 广义坐标序列
+        
+        对于每个时刻 t，z_t = f(x_{t-W+1}, ..., x_t)
         """
         if x.dim() == 2:
             x = x.unsqueeze(-1)  # [B, L, 1]
         
-        # 投影
-        h = self.input_proj(x)  # [B, L, z_dim*2]
+        B, L, D = x.shape
+        W = self.window_size
         
-        # 因果卷积
-        h = h.transpose(1, 2)  # [B, z_dim*2, L]
-        h = self.conv(h)[:, :, :x.shape[1]]  # [B, z_dim, L]
-        h = h.transpose(1, 2)  # [B, L, z_dim]
+        # 为序列开头 padding（用第一个值填充）
+        pad_size = W - 1
+        x_padded = F.pad(x.transpose(1, 2), (pad_size, 0), mode='replicate')  # [B, D, L+pad]
+        x_padded = x_padded.transpose(1, 2)  # [B, L+pad, D]
         
-        # 输出 + 归一化
-        z = self.out_proj(F.silu(h))
-        z = self.norm(z)  # 稳定尺度，对 eps 选择至关重要
+        # 对每个时刻提取窗口并编码
+        # 使用 unfold 实现高效的滑动窗口
+        # x_padded: [B, L+pad, D] -> windows: [B, L, W, D]
+        windows = x_padded.unfold(1, W, 1)  # [B, L, D, W]
+        windows = windows.permute(0, 1, 3, 2)  # [B, L, W, D]
+        
+        # 批量处理所有窗口
+        B, L_out, W, D = windows.shape
+        windows_flat = windows.reshape(B * L_out, W, D)  # [B*L, W, D]
+        
+        # 编码所有窗口
+        z_flat = self._encode_single_window(windows_flat)  # [B*L, z_dim]
+        
+        # 重塑回序列
+        z = z_flat.reshape(B, L_out, self.z_dim)  # [B, L, z_dim]
+        
+        # 不再归一化，让 z 保持由 Tanh 约束的尺度
         
         return z
+    
+    def encode_last(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """
+        只编码最后一个时刻的状态（高效推理）
+        
+        返回: (z_t, x_t, dx_t, d2x_t)
+        """
+        if x.dim() == 2:
+            x = x.unsqueeze(-1)
+        
+        B, L, D = x.shape
+        W = min(self.window_size, L)
+        
+        # 取最后 W 个点
+        window = x[:, -W:, :]  # [B, W, D]
+        
+        # 计算导数
+        x_t, dx_t, d2x_t = self._compute_derivatives(window)
+        
+        # 编码
+        z_t = self._encode_single_window(window)
+        
+        return z_t, x_t.squeeze(-1), dx_t.squeeze(-1), d2x_t.squeeze(-1)
+
+
+# 保持向后兼容的别名
+StateEncoder = DynamicStateEncoder
 
 
 class MetricEncoder(nn.Module):
@@ -366,7 +514,7 @@ class MetricEncoder(nn.Module):
     def __init__(
         self, 
         z_dim: int, 
-        hidden_mult: int = 8,  # 增强容量：6 -> 8
+        hidden_mult: int = 16,  
         unconstrained: bool = False,
         min_diag_bias: float = 0.0,
     ):
@@ -668,8 +816,10 @@ class ProbabilisticDecoder(nn.Module):
             mu: [B] 均值
             sigma: [B] 标准差
         """
-        mu = self.mu_net(d2z).squeeze(-1)
-        log_var = self.logvar_net(d2z).squeeze(-1)
+
+        
+        mu = self.mu_net(d2z).squeeze(-1) 
+        log_var = self.logvar_net(d2z).squeeze(-1) 
         
         # 标准差 = sqrt(exp(log_var)) = exp(log_var / 2)
         # 软裁剪到合理范围
@@ -700,13 +850,19 @@ class ProbabilisticDecoder(nn.Module):
 
 class MetricEvolutionModel(nn.Module):
     """
-    度规涌现演化模型 - 暴论版本
+    度规涌现演化模型 - 动力学状态推断版
     
     核心链条：
-        1. 感知层：x → z → g(z)
-        2. 涌现层：g(z) → Γ (向量化计算)
-        3. 法则层：Γ, dz → a_geodesic + F_external → d²z
-        4. 概率层：d²z → P(d²x | μ, σ)
+        1. 感知层：x → z（通过 DynamicStateEncoder 从局部窗口推断）
+        2. 度规层：z → g(z)
+        3. 涌现层：g(z) → Γ (向量化计算)
+        4. 法则层：Γ, dz → a_geodesic + F_external → d²z
+        5. 概率层：d²z → P(d²x | μ, σ)
+    
+    第一性原理：
+        - z 的"自涌现"通过 d²x 损失驱动
+        - 链式反向传播迫使 StateEncoder 学习物理意义的相空间坐标
+        - 几何加速度 a_geodesic = -Γ^k_{ij} dz^i dz^j 驱动流形结构
     
     模式：
         - constrained: 正定度规，稳定训练
@@ -719,13 +875,20 @@ class MetricEvolutionModel(nn.Module):
         input_dim: int = 1,
         hidden_mult: int = 6,         # MetricEncoder 隐藏层倍数
         unconstrained: bool = False,  # 暴论模式
+        window_size: int = 4,         # 状态推断窗口大小
     ):
         super().__init__()
         self.z_dim = z_dim
+        self.input_dim = input_dim
         self.unconstrained = unconstrained
+        self.window_size = window_size
         
-        # 1. 感知层
-        self.state_encoder = StateEncoder(input_dim, z_dim)
+        # 1. 感知层：动力学状态推断网络
+        self.state_encoder = DynamicStateEncoder(
+            input_dim, z_dim, window_size=window_size
+        )
+        
+        # 2. 度规层
         self.metric_encoder = MetricEncoder(
             z_dim, 
             hidden_mult=hidden_mult,
@@ -733,52 +896,53 @@ class MetricEvolutionModel(nn.Module):
             min_diag_bias=0.0 if unconstrained else 0.1,
         )
         
-        # 2. 涌现层 - 向量化版本
+        # 3. 涌现层 - 向量化版本
         self.christoffel = ChristoffelComputer(base_eps=1e-3)
         self.geodesic = GeodesicAcceleration()
         
-        # 3. 法则层
+        # 4. 法则层
         self.external_force = ExternalForce(z_dim)
         
-        # 4. 概率解码层
-        self.decoder = ProbabilisticDecoder(z_dim, 1)
+        # 5. 概率解码层
+        self.decoder = ProbabilisticDecoder(z_dim, input_dim)
     
     def forward(self, values: Tensor, compute_christoffel: bool = True) -> Dict[str, Tensor]:
         """
-        values: [B, L] 输入序列
+        前向传播 - 动力学状态推断版
         
+        values: [B, L] 输入序列
         返回: 完整的演化信息，包括分布参数
         """
         B, L = values.shape
         
+        # 1. 感知层：x → z（通过局部窗口推断）
+        z = self.state_encoder(values)  # [B, L, z_dim]
+        
+        # 2. 度规层：z → g(z)
+        g = self.metric_encoder(z)  # [B, L, D, D]
+        
         # 计算微分结构
-        dx = values[:, 1:] - values[:, :-1]
-        x_last = values[:, -1]
-        dx_last = dx[:, -1]
-        
-        # 1. 感知层：x → z
-        z = self.state_encoder(values)
-        
-        # 2. 感知层：z → g(z)
-        g = self.metric_encoder(z)
+        dx = values[:, 1:] - values[:, :-1]  # [B, L-1]
+        x_last = values[:, -1]  # [B]
+        dx_last = dx[:, -1] if L > 1 else torch.zeros_like(x_last)  # [B]
         
         # 计算 z 的速度 dz
-        dz = z[:, 1:] - z[:, :-1]
-        dz_last = dz[:, -1]
-        z_last = z[:, -1]
+        dz = z[:, 1:, :] - z[:, :-1, :]  # [B, L-1, z_dim]
+        dz_last = dz[:, -1, :] if L > 1 else torch.zeros(B, self.z_dim, device=values.device)
+        z_last = z[:, -1, :]  # [B, z_dim]
         
         # 3. 涌现层：g → Γ (向量化)
         if compute_christoffel:
-            z_for_gamma = z_last.unsqueeze(1)
-            g_for_gamma = g[:, -1:, :, :]
+            z_for_gamma = z_last.unsqueeze(1)  # [B, 1, z_dim]
+            g_for_gamma = g[:, -1:, :, :]  # [B, 1, D, D]
             
             Gamma = self.christoffel(z_for_gamma, g_for_gamma, self.metric_encoder)
-            Gamma = Gamma.squeeze(1)
+            Gamma = Gamma.squeeze(1)  # [B, D, D, D]
             
             # 4. 法则层：测地线加速度
-            dz_for_geo = dz_last.unsqueeze(1)
+            dz_for_geo = dz_last.unsqueeze(1)  # [B, 1, z_dim]
             a_geo = self.geodesic(dz_for_geo, Gamma.unsqueeze(1))
-            a_geo = a_geo.squeeze(1)
+            a_geo = a_geo.squeeze(1)  # [B, z_dim]
         else:
             Gamma = None
             a_geo = torch.zeros(B, self.z_dim, device=values.device)
@@ -787,32 +951,54 @@ class MetricEvolutionModel(nn.Module):
         F_ext = self.external_force(z_last, dz_last)
         
         # 6. 总加速度
-        d2z = a_geo + F_ext
+        d2z = a_geo + F_ext  # [B, z_dim]
         
         # 7. 概率解码：输出分布参数
-        mu, sigma = self.decoder(d2z)
+        mu, sigma = self.decoder(d2z)  # 预测 d²x
         
-        # 8. 采样或用均值作为预测
-        pred_d2x = mu  # 用均值作为点估计
-        
-        # 9. 重建下一个位置
+        # 8. 重建下一个位置
+        pred_d2x = mu
         x_new = x_last + dx_last + pred_d2x
         
         return {
             'x_new': x_new,
             'pred_d2x': pred_d2x,
-            'mu': mu,           # 分布均值
-            'sigma': sigma,     # 分布标准差（不确定性）
+            'mu': mu,
+            'sigma': sigma,
             'x_last': x_last,
             'dx_last': dx_last,
             'z': z,
-            'metric': g,        # 度规张量（用于签名分析）
+            'z_last': z_last,
+            'dz_last': dz_last,
+            'metric': g,
             'g': g,
             'Gamma': Gamma,
             'a_geodesic': a_geo,
             'F_external': F_ext,
             'd2z': d2z,
         }
+    
+    def forward_with_derivatives(self, values: Tensor) -> Dict[str, Tensor]:
+        """
+        前向传播 + 显式导数计算（用于 d²x 损失驱动训练）
+        
+        核心：直接计算观测空间的 d²x_true，用于监督信号
+        """
+        out = self.forward(values, compute_christoffel=True)
+        
+        B, L = values.shape
+        
+        # 显式计算观测空间的二阶导数
+        if L >= 3:
+            # d²x ≈ x_{t} - 2*x_{t-1} + x_{t-2}
+            d2x_true = values[:, 2:] - 2 * values[:, 1:-1] + values[:, :-2]  # [B, L-2]
+            d2x_last = d2x_true[:, -1]  # [B]
+        else:
+            d2x_last = torch.zeros(B, device=values.device)
+        
+        out['d2x_true'] = d2x_last
+        
+        return out
     
     def compute_loss(
         self, 

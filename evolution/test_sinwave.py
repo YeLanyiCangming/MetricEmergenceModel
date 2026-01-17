@@ -105,21 +105,29 @@ def generate_simple_sinwave(
 
 
 def train_sinwave_model(
-    epochs: int = 10,
-    z_dim: int = 4,
+    epochs: int = 50,
+    z_dim: int = 2,
     n_train_samples: int = 10,
     seq_len: int = 40,
     seed: int = 42,
     verbose: bool = True,
+    window_size: int = 4,
 ) -> Tuple[torch.nn.Module, Dict]:
     """
-    训练正弦波预测模型 - 纯几何版
+    训练正弦波预测模型 - d²x 损失驱动自涌现版
     
-    特点：
-    1. 只用 10 条简单正弦波训练
-    2. z_dim=4 小模型
-    3. 完全禁止外力，纯几何推导
-    4. 目标: 100% 几何占比
+    第一性原理训练范式：
+        1. 核心损失：d²x 预测误差
+        2. 外力缚化：F_ext = 0，迫使模型使用几何加速度
+        3. z 空间自涌现：通过链式反向传播，迫使 StateEncoder 
+           学习物理意义的相空间坐标
+    
+    参数:
+        epochs: 训练轮数
+        z_dim: 隐空间维度（建议 2-4，对应物理自由度）
+        n_train_samples: 训练样本数
+        seq_len: 序列长度
+        window_size: 状态推断窗口大小
     """
     from .model import MetricEvolutionModel
     
@@ -129,24 +137,31 @@ def train_sinwave_model(
     
     if verbose:
         print(f"\n{'='*60}")
-        print("正弦波预测 - 纯几何推导（外力=0）")
-        print(f"  z_dim={z_dim}, epochs={epochs}")
+        print("动力学状态推断网络 - d²x 损失驱动训练")
+        print(f"  z_dim={z_dim}, epochs={epochs}, window_size={window_size}")
+        print(f"  核心：d²x 损失驱动 z 空间自涌现")
+        print(f"  约束：F_ext=0，纯几何推导")
         print('='*60)
     
     # 创建模型
     model = MetricEvolutionModel(
-        z_dim=z_dim, input_dim=1,
-        hidden_mult=4, unconstrained=False,
+        z_dim=z_dim, 
+        input_dim=1,
+        hidden_mult=4, 
+        unconstrained=False,
+        window_size=window_size,
     ).to(device).to(dtype)
     
-    # 禁用外力网络的梯度
+    # 禁用外力：第一性原理要求，纯几何推导
     for param in model.external_force.parameters():
         param.requires_grad = False
-        param.data.zero_()  # 置零
+        param.data.zero_()
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    # 优化器：AdamW + 低学习率
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)
     
-    # 预生成 10 条训练数据
+    # 生成训练数据：简单正弦波，不同相位
     train_data = []
     freq = 0.5
     for i in range(n_train_samples):
@@ -155,46 +170,124 @@ def train_sinwave_model(
         seq = torch.tensor(y, device=device, dtype=dtype).unsqueeze(0)
         train_data.append(seq)
     
-    history = {'loss': [], 'geo_ratio': []}
+    history = {
+        'loss': [], 
+        'd2x_loss': [], 
+        'det_reg': [], 
+        'geo_ratio': [],
+        'z_cycle_loss': [],
+        'multi_step_loss': [],
+    }
+    
+    # 周期点数：T = 1/freq = 2s = 20点 (dt=0.1)
+    period_points = int(1.0 / freq / 0.1)
     
     for epoch in range(1, epochs + 1):
         model.train()
         
-        total_loss = 0
-        total_geo = 0
+        total_d2x = 0
+        total_det = 0
+        total_geo_ratio = 0
+        total_cycle = 0
+        total_multi = 0
         
         for seq in train_data:
-            out = model.forward(seq[:, :-1])
-            target = seq[:, -1]
+            B = 1
+            L = seq.shape[1]
             
-            # 纯几何损失：只用测地线加速度
-            pred = out['x_last'] + out['dx_last'] + model.decoder(out['a_geodesic'])[0]
-            loss = ((pred - target) ** 2).mean()
+            # ===== 1. 多步预测损失（核心！） =====
+            # 从窗口开始，多步自回归预测
+            n_pred_steps = min(10, L - window_size - 2)
+            if n_pred_steps > 0:
+                start_idx = window_size + 2  # 确保有足够的点计算 d²x
+                current = seq[:, :start_idx].clone()
+                multi_loss = torch.tensor(0.0, device=device, dtype=dtype)
+                
+                for step in range(n_pred_steps):
+                    # 前向传播
+                    out = model.forward_with_derivatives(current)
+                    
+                    # 预测下一个 d²x
+                    d2x_pred = out['pred_d2x']  # [B]
+                    
+                    # 下一个位置
+                    x_last = out['x_last']
+                    dx_last = out['dx_last']
+                    x_next = x_last + dx_last + d2x_pred
+                    
+                    # 目标
+                    if start_idx + step < L:
+                        true_next = seq[:, start_idx + step]
+                        # 远期误差权重更高
+                        step_weight = 1.0 + step * 0.2
+                        multi_loss = multi_loss + step_weight * ((x_next - true_next) ** 2).mean()*10
+                    
+                    # 更新序列
+                    current = torch.cat([current, x_next.unsqueeze(1)], dim=1)
+                
+                multi_loss = multi_loss / max(1, n_pred_steps)
+            else:
+                multi_loss = torch.tensor(0.0, device=device, dtype=dtype)
             
-            # 度规正则化
+            # ===== 2. 单步 d²x 损失 =====
+            out = model.forward_with_derivatives(seq)
+            d2x_true = out['d2x_true']
+            d2x_pred = out['pred_d2x']
+            d2x_loss = ((d2x_pred - d2x_true) ** 2).mean()
+            
+            # ===== 3. 度规正则化 =====
             g_last = out['g'][:, -1]
             det_g = torch.linalg.det(g_last)
-            det_reg = ((det_g - 0.1) ** 2).mean() * 0.01
+            det_reg = ((det_g.abs() - 0.1) ** 2).mean() * 0.01
             
-            total = loss + det_reg
+            # ===== 4. z 空间周期轨道损失 =====
+            z = out['z']
+            if z.shape[1] > period_points:
+                z_t = z[:, :-period_points, :]
+                z_t_T = z[:, period_points:, :]
+                cycle_loss = ((z_t - z_t_T) ** 2).mean() * 10
+            else:
+                cycle_loss = torch.tensor(0.0, device=device, dtype=dtype)
+            
+            # ===== 总损失 =====
+            # d2x_loss 是主要驱动力，权重更高
+            loss = 5.0 * d2x_loss + 1.0 * multi_loss + det_reg + cycle_loss
             
             optimizer.zero_grad()
-            total.backward()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
-            total_loss += loss.item()
-            total_geo += out['a_geodesic'].norm().item()
+            # 统计几何加速度占比
+            geo_norm = out['a_geodesic'].norm().item()
+            ext_norm = out['F_external'].norm().item()
+            geo_ratio = geo_norm / (geo_norm + ext_norm + 1e-8)
+            
+            total_d2x += d2x_loss.item()
+            total_det += det_reg.item()
+            total_geo_ratio += geo_ratio
+            total_cycle += cycle_loss.item() if isinstance(cycle_loss, torch.Tensor) else cycle_loss
+            total_multi += multi_loss.item() if isinstance(multi_loss, torch.Tensor) else multi_loss
         
-        history['loss'].append(total_loss / n_train_samples)
-        history['geo_ratio'].append(1.0)  # 100% 几何
+        scheduler.step()
         
-        # 每轮输出
-        if verbose:
-            print(f"E{epoch:2d}: loss={total_loss/n_train_samples:.4f}, geo=100.0%")
+        n = n_train_samples
+        history['d2x_loss'].append(total_d2x / n)
+        history['det_reg'].append(total_det / n)
+        history['geo_ratio'].append(total_geo_ratio / n)
+        history['z_cycle_loss'].append(total_cycle / n)
+        history['multi_step_loss'].append(total_multi / n)
+        history['loss'].append((total_d2x + total_det + total_cycle + total_multi) / n)
+        
+        if verbose and (epoch % max(1, epochs // 10) == 0 or epoch == 1):
+            print(f"E{epoch:3d}: d2x={total_d2x/n:.6f}, multi={total_multi/n:.6f}, "
+                  f"geo_ratio={total_geo_ratio/n:.1%}, cycle={total_cycle/n:.6f}")
     
     if verbose:
-        print(f"\n训练完成! 纯几何推导")
+        print(f"\n训练完成!")
+        print(f"  最终 d²x 损失: {history['d2x_loss'][-1]:.6f}")
+        print(f"  最终多步损失: {history['multi_step_loss'][-1]:.6f}")
+        print(f"  最终几何占比: {history['geo_ratio'][-1]:.1%}")
     
     return model, history
 
@@ -381,28 +474,40 @@ def visualize_results(
 
 
 def test_sinwave_prediction(
-    n_given: int = 20,
-    n_predict: int = 10,
-    epochs: int = 10,
-    z_dim: int = 4,
+    n_given: int = 10,
+    n_predict: int = 50,
+    epochs: int = 50,
+    z_dim: int = 2,
     seed: int = 42,
     save_path: Optional[str] = 'sinwave_prediction.png',
     show: bool = True,
+    window_size: int = 4,
 ):
     """
     完整测试：训练模型 -> 预测正弦波 -> 可视化
     
-    纯几何版：
-    - 10 条简单正弦波训练
-    - z_dim=4 小模型
-    - 禁止外力，纯几何推导
+    动力学状态推断版：
+        - d²x 损失驱动 z 空间自涌现
+        - z_dim=2 小模型（对应位置+速度）
+        - 禁止外力，纯几何推导
+        - 窗口大小 window_size=4（极小的观测窗口）
+    
+    参数:
+        n_given: 给定的观测点数
+        n_predict: 预测步数
+        epochs: 训练轮数
+        z_dim: 隐空间维度（2-4）
+        window_size: 状态推断窗口大小
     """
     set_seed(seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     print("\n" + "="*60)
-    print("正弦波预测测试 - 度规涌现模型")
+    print("动力学状态推断网络 - 正弦波预测测试")
     print("="*60)
+    print(f"  n_given={n_given}, n_predict={n_predict}")
+    print(f"  z_dim={z_dim}, window_size={window_size}")
+    print(f"  epochs={epochs}")
     
     # 1. 训练模型
     model, history = train_sinwave_model(
@@ -410,6 +515,7 @@ def test_sinwave_prediction(
         z_dim=z_dim,
         seed=seed,
         verbose=True,
+        window_size=window_size,
     )
     
     # 2. 生成测试数据（让输入包含峰值，验证能否学会返回）
@@ -436,22 +542,27 @@ def test_sinwave_prediction(
     
     print(f"\n{'='*40}")
     print("预测结果:")
-    for i in range(n_predict):
+    for i in range(min(10, n_predict)):
         print(f"  Step {i+1:2d}: pred={y_pred[i]:+.4f}, true={y_true[i]:+.4f}, err={errors[i]:.4f}")
+    if n_predict > 10:
+        print(f"  ... (共 {n_predict} 步)")
     print(f"{'='*40}")
     print(f"平均误差: {avg_error:.4f}")
     print(f"最大误差: {max_error:.4f}")
     
     # 5. 可视化
-    print("\n生成可视化...")
-    fig = visualize_results(
-        t_given, y_given,
-        t_predict, y_true, y_pred,
-        result['metrics'],
-        result['z_trajectory'],
-        save_path=save_path,
-        show=show,
-    )
+    if show or save_path:
+        print("\n生成可视化...")
+        fig = visualize_results(
+            t_given, y_given,
+            t_predict, y_true, y_pred,
+            result['metrics'],
+            result['z_trajectory'],
+            save_path=save_path,
+            show=show,
+        )
+    else:
+        fig = None
     
     return {
         'model': model,
@@ -537,15 +648,15 @@ def visualize_metric_evolution(
 
 
 if __name__ == '__main__':
-    # 运行完整测试
+    # 运行完整测试：动力学状态推断版
     result = test_sinwave_prediction(
-        n_given=30,
-        n_predict=20,
-        epochs=300,
-        z_dim=8,
-        seed=42,
+        n_given=20,
+        n_predict=60,
+        epochs=100,
+        z_dim=2,
         save_path='sinwave_prediction.png',
         show=True,
+        window_size=4,
     )
     
     # 可选：可视化度规演化
