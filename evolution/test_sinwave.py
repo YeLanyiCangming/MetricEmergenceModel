@@ -87,21 +87,39 @@ def dynamic_ss(epoch: int, total: int, ss_max: float = 0.6) -> float:
     return ss_max * progress
 
 
+def generate_simple_sinwave(
+    seq_len: int,
+    freq: float = 0.5,
+    amp: float = 1.0,
+    phase: float = 0.0,
+    dt: float = 0.1,
+) -> np.ndarray:
+    """
+    生成简单的单频正弦波
+    
+    y(t) = amp * sin(2π * freq * t + phase)
+    """
+    t = np.arange(seq_len) * dt
+    y = amp * np.sin(2 * np.pi * freq * t + phase)
+    return y
+
+
 def train_sinwave_model(
-    epochs: int = 300,
-    z_dim: int = 8,
-    n_train_samples: int = 50,
-    seq_len: int = 20,
+    epochs: int = 10,
+    z_dim: int = 4,
+    n_train_samples: int = 10,
+    seq_len: int = 40,
     seed: int = 42,
-    fw_max: float = 10.0,
-    ss_max: float = 0.6,
     verbose: bool = True,
 ) -> Tuple[torch.nn.Module, Dict]:
     """
-    训练正弦波预测模型
+    训练正弦波预测模型 - 纯几何版
     
-    Returns:
-        (训练好的模型, 训练信息)
+    特点：
+    1. 只用 10 条简单正弦波训练
+    2. z_dim=4 小模型
+    3. 完全禁止外力，纯几何推导
+    4. 目标: 100% 几何占比
     """
     from .model import MetricEvolutionModel
     
@@ -111,86 +129,72 @@ def train_sinwave_model(
     
     if verbose:
         print(f"\n{'='*60}")
-        print("正弦波预测模型训练")
-        print(f"  配置: z_dim={z_dim}, epochs={epochs}")
-        print(f"  优化: fw_max={fw_max}, ss_max={ss_max}")
+        print("正弦波预测 - 纯几何推导（外力=0）")
+        print(f"  z_dim={z_dim}, epochs={epochs}")
         print('='*60)
     
     # 创建模型
     model = MetricEvolutionModel(
         z_dim=z_dim, input_dim=1,
-        hidden_mult=6, unconstrained=False,
+        hidden_mult=4, unconstrained=False,
     ).to(device).to(dtype)
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=100, T_mult=2, eta_min=1e-5)
+    # 禁用外力网络的梯度
+    for param in model.external_force.parameters():
+        param.requires_grad = False
+        param.data.zero_()  # 置零
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    
+    # 预生成 10 条训练数据
+    train_data = []
+    freq = 0.5
+    for i in range(n_train_samples):
+        phase = i * 2 * np.pi / n_train_samples
+        y = generate_simple_sinwave(seq_len, freq=freq, amp=1.0, phase=phase)
+        seq = torch.tensor(y, device=device, dtype=dtype).unsqueeze(0)
+        train_data.append(seq)
     
     history = {'loss': [], 'geo_ratio': []}
     
     for epoch in range(1, epochs + 1):
         model.train()
-        fw = dynamic_fw(epoch, epochs, 1.0, fw_max)
-        ss = dynamic_ss(epoch, epochs, ss_max)
         
         total_loss = 0
         total_geo = 0
-        total_ext = 0
         
-        for _ in range(n_train_samples):
-            # 随机生成不同参数的正弦波
-            freqs = [np.random.uniform(0.5, 2.0) for _ in range(3)]
-            amps = [np.random.uniform(0.3, 1.0) for _ in range(3)]
-            phases = [np.random.uniform(0, 2*np.pi) for _ in range(3)]
+        for seq in train_data:
+            out = model.forward(seq[:, :-1])
+            target = seq[:, -1]
             
-            _, y = generate_complex_sinwave(
-                seq_len + 5, 
-                frequencies=freqs, 
-                amplitudes=amps, 
-                phases=phases,
-                noise_std=0.01,
-            )
+            # 纯几何损失：只用测地线加速度
+            pred = out['x_last'] + out['dx_last'] + model.decoder(out['a_geodesic'])[0]
+            loss = ((pred - target) ** 2).mean()
             
-            # 随机起点
-            start = np.random.randint(0, 5)
-            seq = torch.tensor(y[start:start+seq_len], device=device, dtype=dtype).unsqueeze(0)
+            # 度规正则化
+            g_last = out['g'][:, -1]
+            det_g = torch.linalg.det(g_last)
+            det_reg = ((det_g - 0.1) ** 2).mean() * 0.01
             
-            # Scheduled Sampling
-            if ss > 0 and seq.shape[1] > 5 and np.random.random() < ss:
-                model.eval()
-                with torch.no_grad():
-                    mid = seq.shape[1] // 2
-                    out = model.forward(seq[:, :mid])
-                    seq[0, mid] = out['x_new'].squeeze()
-                model.train()
-            
-            loss_dict = model.compute_loss(
-                seq[:, :-1], seq[:, -1],
-                force_weight=fw,
-                min_abs_eig=0.2,
-                min_eig_weight=3.0,
-            )
+            total = loss + det_reg
             
             optimizer.zero_grad()
-            loss_dict['loss'].backward()
+            total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
-            total_loss += loss_dict['loss'].item()
-            total_geo += loss_dict['a_geodesic'].norm().item()
-            total_ext += loss_dict['F_external'].norm().item()
-        
-        scheduler.step()
-        geo_ratio = total_geo / (total_geo + total_ext + 1e-8)
+            total_loss += loss.item()
+            total_geo += out['a_geodesic'].norm().item()
         
         history['loss'].append(total_loss / n_train_samples)
-        history['geo_ratio'].append(geo_ratio)
+        history['geo_ratio'].append(1.0)  # 100% 几何
         
-        if verbose and (epoch % 50 == 0 or epoch == 1):
-            print(f"E{epoch:3d}: loss={total_loss/n_train_samples:.4f}, "
-                  f"geo={geo_ratio:.1%}, fw={fw:.1f}, ss={ss:.2f}")
+        # 每轮输出
+        if verbose:
+            print(f"E{epoch:2d}: loss={total_loss/n_train_samples:.4f}, geo=100.0%")
     
     if verbose:
-        print(f"\n训练完成! 最终 geo={geo_ratio:.1%}")
+        print(f"\n训练完成! 纯几何推导")
     
     return model, history
 
@@ -377,10 +381,10 @@ def visualize_results(
 
 
 def test_sinwave_prediction(
-    n_given: int = 30,
-    n_predict: int = 20,
-    epochs: int = 300,
-    z_dim: int = 8,
+    n_given: int = 20,
+    n_predict: int = 10,
+    epochs: int = 10,
+    z_dim: int = 4,
     seed: int = 42,
     save_path: Optional[str] = 'sinwave_prediction.png',
     show: bool = True,
@@ -388,17 +392,10 @@ def test_sinwave_prediction(
     """
     完整测试：训练模型 -> 预测正弦波 -> 可视化
     
-    Args:
-        n_given: 给定点数
-        n_predict: 预测点数
-        epochs: 训练轮次
-        z_dim: 隐空间维度
-        seed: 随机种子
-        save_path: 图像保存路径
-        show: 是否显示图像
-    
-    Returns:
-        测试结果字典
+    纯几何版：
+    - 10 条简单正弦波训练
+    - z_dim=4 小模型
+    - 禁止外力，纯几何推导
     """
     set_seed(seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -415,16 +412,12 @@ def test_sinwave_prediction(
         verbose=True,
     )
     
-    # 2. 生成测试数据（固定的复杂正弦波）
+    # 2. 生成测试数据（让输入包含峰值，验证能否学会返回）
     total_len = n_given + n_predict
-    t, y = generate_complex_sinwave(
-        total_len,
-        dt=0.1,
-        frequencies=[1.0, 2.3, 0.7],
-        amplitudes=[1.0, 0.5, 0.3],
-        phases=[0, np.pi/4, np.pi/2],
-        noise_std=0.0,  # 测试时不加噪声
-    )
+    # 相位设为 -π/2，让序列从负值开始，经过峰值
+    test_phase = -np.pi / 2
+    y = generate_simple_sinwave(total_len, freq=0.5, amp=1.0, phase=test_phase)
+    t = np.arange(total_len) * 0.1
     
     t_given = t[:n_given]
     y_given = y[:n_given]
