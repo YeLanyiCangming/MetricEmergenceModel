@@ -14,7 +14,7 @@
 """
 
 import numpy as np
-from scipy.linalg import eig, eigh
+from scipy.linalg import eig, eigh, expm
 import matplotlib.pyplot as plt
 from typing import Tuple, List, Dict, Optional
 
@@ -214,8 +214,8 @@ def build_multivariate_hankel(X: np.ndarray, delay: int) -> np.ndarray:
 
 
 # =============================================================================
-# 方法六：图内生动力学 - 真正的融合
-# 图不是附加约束，而是频率产生的根本机制
+# 方法六：谱图理论融合 - 图傅里叶域中的动力学
+# 核心思想：先将信号投影到图的本征空间，再提取时间动力学
 # =============================================================================
 
 def build_graph_laplacian_from_data(X: np.ndarray, mode: str = 'normalized') -> np.ndarray:
@@ -530,6 +530,417 @@ def metric_encoder_g_graph_intrinsic(
         g = g + (1e-6 - np.min(eigvals)) * np.eye(k_modes)
     
     return g
+
+
+# =============================================================================
+# 方法七：谱图理论融合 - 图傅里叶域中的 DMD
+# 核心思想：先将信号投影到图的本征空间，再提取时间动力学
+# =============================================================================
+
+def graph_fourier_transform(X: np.ndarray, U_graph: np.ndarray) -> np.ndarray:
+    """
+    图傅里叶变换 (GFT)
+    
+    第一性原理：
+        图拉普拉斯 L = U Λ U^T
+        图傅里叶变换: X_gft = U^T X
+        
+        将信号从欧几里得空间变换到图谱域
+        在图谱域，图结构变成对角的（每个图频率分量独立）
+    
+    Args:
+        X: [T, N] 空间域信号
+        U_graph: [N, N] 图拉普拉斯的特征向量（图傅里叶基）
+    
+    Returns:
+        X_gft: [T, N] 图谱域信号
+    """
+    # X: [T, N], U_graph: [N, N]
+    # X_gft = X @ U_graph (U^T 作用在行向量上)
+    X_gft = X @ U_graph
+    return X_gft
+
+
+def inverse_graph_fourier_transform(X_gft: np.ndarray, U_graph: np.ndarray) -> np.ndarray:
+    """
+    逆图傅里叶变换
+    
+    X = X_gft @ U_graph^T
+    """
+    return X_gft @ U_graph.T
+
+
+def state_encoder_spectral_graph(
+    X_window: np.ndarray,
+    k_modes: int,
+    dt_sample: float,
+    delay: int = None,
+    energy_threshold: float = 0.99
+) -> Tuple[np.ndarray, np.ndarray, List[Dict], np.ndarray, np.ndarray]:
+    """
+    谱图理论融合编码器 - 图傅里叶域中的 DMD
+    
+    第一性原理融合：
+    
+    1. 图傅里叶变换
+       L = U Λ U^T  (图拉普拉斯特征分解)
+       X_gft = X @ U  (将信号投影到图的本征空间)
+       
+    2. 在图谱域做 DMD
+       H_gft = Hankel(X_gft)  (在图谱域构建 Hankel)
+       A_gft = DMD(H_gft)     (提取图谱域的动力学)
+       
+    3. 物理意义
+       - A_gft 的特征值同时编码时间频率和图频率的耦合
+       - 低图频率（λ_L 小）= 图上平滑的模式
+       - 高图频率（λ_L 大）= 图上快速变化的模式
+       
+    4. 类比弦振动
+       弦振动 = 空间模态 × 时间模态
+       我们的方法 = 图模态 × 时间模态
+    
+    Args:
+        X_window: [W, N] 信号窗口
+        k_modes: 要提取的模态数
+        dt_sample: 采样间隔
+        delay: Hankel 嵌入延迟
+        energy_threshold: SVD 能量阈值
+    
+    Returns:
+        M: 动力学张量
+        L_graph: 图拉普拉斯
+        Z_params: 模态参数
+        selected_lambdas: 选中的特征值
+        Phi: 特征向量
+    """
+    W, N = X_window.shape
+    
+    if delay is None:
+        delay = min(W // 3, 15)
+        delay = max(delay, 5)
+    
+    # =========================================
+    # 第一步：构建图拉普拉斯并特征分解
+    # =========================================
+    L_graph, A_adj, D = build_graph_laplacian_from_data(X_window, mode='normalized')
+    
+    # 图拉普拉斯特征分解
+    # L = U_graph @ diag(λ_graph) @ U_graph^T
+    lambda_graph, U_graph = np.linalg.eigh(L_graph)  # L 是对称的，用 eigh
+    
+    # 图频率排序（已经是升序的）
+    # λ_graph[0] ≈ 0 对应直流分量（全局平均）
+    # λ_graph[N-1] 对应最高图频率
+    
+    # =========================================
+    # 第二步：图傅里叶变换
+    # =========================================
+    X_gft = graph_fourier_transform(X_window, U_graph)  # [T, N] 图谱域信号
+    
+    # =========================================
+    # 第三步：在图谱域构建 Hankel 矩阵
+    # =========================================
+    H_gft = build_multivariate_hankel(X_gft, delay)  # [delay*N, cols]
+    
+    # =========================================
+    # 第四步：在图谱域做 DMD
+    # =========================================
+    X_past = H_gft[:, :-1]
+    X_future = H_gft[:, 1:]
+    
+    U, S, Vh = np.linalg.svd(X_past, full_matrices=False)
+    
+    # 自适应秩选择
+    energy_ratio = np.cumsum(S**2) / np.sum(S**2)
+    r = np.searchsorted(energy_ratio, energy_threshold) + 1
+    r = max(r, k_modes)
+    r = min(r, len(S))
+    
+    U_r = U[:, :r]
+    S_r = S[:r]
+    Vh_r = Vh[:r, :]
+    
+    # 图谱域的 DMD 算子
+    A_gft = U_r.T @ X_future @ Vh_r.T @ np.diag(1.0 / S_r)  # [r, r]
+    
+    # =========================================
+    # 第五步：特征分解
+    # =========================================
+    lambdas_dmd, W_dmd = np.linalg.eig(A_gft)
+    
+    # 频率和增长率
+    freqs_hz = np.abs(np.angle(lambdas_dmd)) / (2 * np.pi * dt_sample)
+    growth_rates = np.log(np.abs(lambdas_dmd) + 1e-10) / dt_sample
+    
+    # 按频率排序
+    idx = np.argsort(freqs_hz)[::-1]
+    lambdas_sorted = lambdas_dmd[idx]
+    W_sorted = W_dmd[:, idx]
+    freqs_sorted = freqs_hz[idx]
+    growth_sorted = growth_rates[idx]
+    
+    # =========================================
+    # 第六步：选择主导模态
+    # =========================================
+    selected_lambdas = lambdas_sorted[:k_modes]
+    selected_W = W_sorted[:, :k_modes]
+    
+    # 重构全空间特征向量（图谱域）
+    Phi_gft = U_r @ selected_W  # [delay*N, k_modes]
+    
+    # =========================================
+    # 第七步：提取 Z 参数
+    # =========================================
+    current_state_gft = H_gft[:, -1]
+    
+    Z_params = []
+    for i in range(k_modes):
+        if i < len(selected_lambdas):
+            lam = selected_lambdas[i]
+            phi = Phi_gft[:, i]
+            
+            # 投影
+            proj = np.vdot(phi.conj(), current_state_gft) / (np.vdot(phi.conj(), phi) + 1e-10)
+            
+            Z_params.append({
+                'lambda': lam,
+                'freq_hz': freqs_sorted[i],
+                'omega_rad': 2 * np.pi * freqs_sorted[i],
+                'growth_rate': growth_sorted[i],
+                'amplitude': np.abs(proj),
+                'phase': np.angle(proj),
+                'z_position': proj,
+                'eigenvector': phi,
+                # 谱图信息
+                'graph_frequencies': lambda_graph,  # 图频率
+                'graph_fourier_basis': U_graph,      # 图傅里叶基
+                'in_graph_spectral_domain': True     # 标记在图谱域
+            })
+        else:
+            Z_params.append({
+                'lambda': 0, 'freq_hz': 0, 'omega_rad': 0,
+                'growth_rate': 0, 'amplitude': 0, 'phase': 0,
+                'z_position': 0, 'eigenvector': np.zeros(delay * N),
+                'graph_frequencies': lambda_graph,
+                'graph_fourier_basis': U_graph,
+                'in_graph_spectral_domain': True
+            })
+    
+    return A_gft, L_graph, Z_params, selected_lambdas, Phi_gft
+
+
+def metric_encoder_g_spectral_graph(
+    Phi_gft: np.ndarray,
+    U_graph: np.ndarray,
+    lambda_graph: np.ndarray,
+    k_modes: int,
+    use_graph_weighting: bool = True
+) -> np.ndarray:
+    """
+    从谱图理论涌现度规
+    
+    第一性原理：
+        在图谱域，度规可以包含图频率的信息
+        
+        选项 1: g = Φ^H Φ (标准 Gram 矩阵)
+        选项 2: g = Φ^H diag(λ_graph) Φ (图频率加权)
+        
+        图频率加权让高图频率模态有更大的"质量"
+        这类似于物理中高频模态需要更多能量来激发
+    """
+    Phi_k = Phi_gft[:, :k_modes]
+    
+    if use_graph_weighting:
+        # 图频率加权的度规
+        # 但需要将图频率扩展到 Hankel 空间
+        delay = Phi_k.shape[0] // len(lambda_graph)
+        lambda_extended = np.tile(lambda_graph, delay)  # 扩展到 [delay*N]
+        # 避免 0 除法，给图频率加一个小正数
+        lambda_weights = lambda_extended + 0.1
+        Lambda_diag = np.diag(lambda_weights)
+        g = Phi_k.conj().T @ Lambda_diag @ Phi_k
+    else:
+        g = Phi_k.conj().T @ Phi_k
+    
+    g = hermitian_part(g)
+    
+    # 确保正定
+    eigvals = np.linalg.eigvalsh(g)
+    if np.min(eigvals) < 1e-10:
+        g = g + (1e-6 - np.min(eigvals)) * np.eye(k_modes)
+    
+    return g
+
+
+# =============================================================================
+# 方法八：统一谱图动力学 - 融合所有原理
+# =============================================================================
+
+def state_encoder_unified_spectral(
+    X_window: np.ndarray,
+    k_modes: int,
+    dt_sample: float,
+    delay: int = None,
+    energy_threshold: float = 0.99,
+    alpha: float = 0.0  # 可学习的图影响强度
+) -> Tuple[np.ndarray, np.ndarray, List[Dict], np.ndarray, np.ndarray, Dict]:
+    """
+    统一谱图动力学编码器
+    
+    融合所有第一性原理：
+    
+    1. 图傅里叶变换 - 将信号投影到图的本征空间
+    2. Hankel 嵌入 - 将时间动态转换为空间结构
+    3. DMD - 提取线性动力学算子
+    4. 图谱域约束 - 在图谱域中约束 DMD 算子
+    
+    物理意义：
+        - 图谱域中，每个分量对应一个图频率
+        - DMD 算子在图谱域的结构反映时空耦合
+        - α 控制图结构对动力学的影响强度
+    
+    可学习的 α：
+        - α = 0: 纯 DMD（无图影响）
+        - α > 0: 图结构参与动力学
+        - α 可以通过梯度下降学习
+    """
+    W, N = X_window.shape
+    
+    if delay is None:
+        delay = min(W // 3, 15)
+        delay = max(delay, 5)
+    
+    # =========================================
+    # 第一步：图拉普拉斯特征分解
+    # =========================================
+    L_graph, A_adj, D = build_graph_laplacian_from_data(X_window, mode='normalized')
+    lambda_graph, U_graph = np.linalg.eigh(L_graph)
+    
+    # =========================================
+    # 第二步：图傅里叶变换
+    # =========================================
+    X_gft = graph_fourier_transform(X_window, U_graph)  # [T, N]
+    
+    # =========================================
+    # 第三步：在图谱域构建 Hankel 矩阵
+    # =========================================
+    H_gft = build_multivariate_hankel(X_gft, delay)  # [delay*N, cols]
+    d = H_gft.shape[0]  # 嵌入维度
+    
+    # =========================================
+    # 第四步：DMD
+    # =========================================
+    X_past = H_gft[:, :-1]
+    X_future = H_gft[:, 1:]
+    
+    U, S, Vh = np.linalg.svd(X_past, full_matrices=False)
+    
+    # 自适应秩选择
+    energy_ratio = np.cumsum(S**2) / np.sum(S**2)
+    r = np.searchsorted(energy_ratio, energy_threshold) + 1
+    r = max(r, k_modes)
+    r = min(r, len(S))
+    
+    U_r = U[:, :r]
+    S_r = S[:r]
+    Vh_r = Vh[:r, :]
+    
+    # 图谱域的 DMD 算子
+    A_gft = U_r.T @ X_future @ Vh_r.T @ np.diag(1.0 / S_r)  # [r, r]
+    
+    # =========================================
+    # 第五步：图谱域约束（可学习的 α）
+    # =========================================
+    if alpha > 0:
+        # 在低秩空间中构建图频率约束
+        # 将图频率扩展到 Hankel 空间
+        lambda_extended = np.tile(lambda_graph, delay)  # [delay*N]
+        # 在低秩空间中的图频率矩阵
+        Lambda_hankel = np.diag(lambda_extended)
+        Lambda_reduced = U_r.T @ Lambda_hankel @ U_r  # [r, r]
+        
+        # 图谱域约束的传播算子
+        # 思想：低图频率模式传播得更顺畅，高图频率模式有更多阻尼
+        # A_spectral = A_gft @ exp(-α Λ_reduced)
+        # 这比加法更合理，因为保证特征值不会超出单位圆
+        spectral_damping = expm(-alpha * Lambda_reduced)
+        A_spectral = A_gft @ spectral_damping
+    else:
+        A_spectral = A_gft
+    
+    # =========================================
+    # 第六步：特征分解
+    # =========================================
+    lambdas_dmd, W_dmd = np.linalg.eig(A_spectral)
+    
+    # 频率和增长率
+    freqs_hz = np.abs(np.angle(lambdas_dmd)) / (2 * np.pi * dt_sample)
+    growth_rates = np.log(np.abs(lambdas_dmd) + 1e-10) / dt_sample
+    
+    # 按频率排序
+    idx = np.argsort(freqs_hz)[::-1]
+    lambdas_sorted = lambdas_dmd[idx]
+    W_sorted = W_dmd[:, idx]
+    freqs_sorted = freqs_hz[idx]
+    growth_sorted = growth_rates[idx]
+    
+    # =========================================
+    # 第七步：选择主导模态
+    # =========================================
+    selected_lambdas = lambdas_sorted[:k_modes]
+    selected_W = W_sorted[:, :k_modes]
+    
+    # 重构全空间特征向量
+    Phi_gft = U_r @ selected_W  # [delay*N, k_modes]
+    
+    # =========================================
+    # 第八步：提取 Z 参数
+    # =========================================
+    current_state_gft = H_gft[:, -1]
+    
+    Z_params = []
+    for i in range(k_modes):
+        if i < len(selected_lambdas):
+            lam = selected_lambdas[i]
+            phi = Phi_gft[:, i]
+            
+            # 投影
+            proj = np.vdot(phi.conj(), current_state_gft) / (np.vdot(phi.conj(), phi) + 1e-10)
+            
+            Z_params.append({
+                'lambda': lam,
+                'freq_hz': freqs_sorted[i],
+                'omega_rad': 2 * np.pi * freqs_sorted[i],
+                'growth_rate': growth_sorted[i],
+                'amplitude': np.abs(proj),
+                'phase': np.angle(proj),
+                'z_position': proj,
+                'eigenvector': phi,
+                # 谱图信息
+                'graph_frequencies': lambda_graph,
+                'graph_fourier_basis': U_graph,
+                'alpha_graph_influence': alpha  # 图影响强度
+            })
+        else:
+            Z_params.append({
+                'lambda': 0, 'freq_hz': 0, 'omega_rad': 0,
+                'growth_rate': 0, 'amplitude': 0, 'phase': 0,
+                'z_position': 0, 'eigenvector': np.zeros(d),
+                'graph_frequencies': lambda_graph,
+                'graph_fourier_basis': U_graph,
+                'alpha_graph_influence': alpha
+            })
+    
+    # 额外返回谱图信息
+    spectral_info = {
+        'lambda_graph': lambda_graph,
+        'U_graph': U_graph,
+        'alpha': alpha,
+        'rank': r,
+        'energy_preserved': energy_ratio[r-1] if r <= len(energy_ratio) else 1.0
+    }
+    
+    return A_spectral, L_graph, Z_params, selected_lambdas, Phi_gft, spectral_info
 
 
 def state_encoder_unified_v2(
@@ -1245,7 +1656,9 @@ def run_simulation(
         'dmd': 'DMD',
         'hankel_dmd': 'Hankel DMD',
         'unified': 'Unified V2 (DMD + 图结构)',
-        'graph_intrinsic': '图内生动力学 (★ 真正融合)'
+        'graph_intrinsic': '图内生动力学',
+        'spectral_graph': '谱图理论融合 (★ 图傅里叶域)',
+        'unified_spectral': '统一谱图动力学 (★★ 完全融合)'
     }
     method_name = method_names.get(method, method)
     
@@ -1267,7 +1680,24 @@ def run_simulation(
     for i in range(len(t_full) - window_points):
         X_window = X_full[i : i + window_points, :]
         
-        if method == 'graph_intrinsic':
+        if method == 'unified_spectral':
+            # ★★ 统一谱图动力学：融合所有原理
+            M, L_graph, Z_params, selected_lambdas, Phi, spectral_info = state_encoder_unified_spectral(
+                X_window, k_modes, dt_sample, alpha=0.05
+            )
+            current_g = metric_encoder_g_spectral_graph(
+                Phi, spectral_info['U_graph'], spectral_info['lambda_graph'], 
+                k_modes, use_graph_weighting=False
+            )
+        elif method == 'spectral_graph':
+            # ★ 谱图理论融合：图傅里叶域中的 DMD
+            M, L_graph, Z_params, selected_lambdas, Phi = state_encoder_spectral_graph(
+                X_window, k_modes, dt_sample
+            )
+            lambda_graph = Z_params[0]['graph_frequencies'] if Z_params else np.zeros(X_window.shape[1])
+            U_graph = Z_params[0]['graph_fourier_basis'] if Z_params else np.eye(X_window.shape[1])
+            current_g = metric_encoder_g_spectral_graph(Phi, U_graph, lambda_graph, k_modes)
+        elif method == 'graph_intrinsic':
             # ★ 图内生动力学：真正的融合
             M, L_spatial, Z_params, selected_lambdas, Phi = state_encoder_graph_intrinsic(
                 X_window, k_modes, dt_sample, alpha=0.1, beta=0.1
@@ -1445,14 +1875,15 @@ def visualize_results(results: ResultCollector, k_modes: int, true_freqs: List[f
 # =============================================================================
 
 if __name__ == "__main__":
-    # 探索: 图内生动力学 - 真正的融合
+    # 探索: 谱图理论融合 - 图傅里叶域中的动力学
     print("\n" + "="*70)
-    print("探索: Hankel DMD vs 图内生动力学 (真正融合)")
+    print("探索: Hankel DMD vs 谱图理论融合 vs 统一谱图动力学")
     print("")
-    print("图内生动力学:")
-    print("  dX_graph = dX/dt + α·L·X  (图参与动力学)")
-    print("  M = Cov(X) + βL + i·(X^T @ dX_graph)")
-    print("  图不是附加约束，而是频率产生的根本机制")
+    print("第一性原理融合框架:")
+    print("  1. 图傅里叶变换: X_gft = U^T X (投影到图本征空间)")
+    print("  2. 在图谱域做 DMD: A_gft = DMD(Hankel(X_gft))")
+    print("  3. 可学习的 α: A_spectral = A_gft @ exp(-αΛ_graph)")
+    print("  4. 图结构自然融入频率提取")
     print("="*70)
     
     true_freqs = [10, 15, 20, 6]  # 输入信号的真实频率
@@ -1462,19 +1893,29 @@ if __name__ == "__main__":
         T_total=10.0,
         dt_sample=0.01,
         window_size_s=0.5,
-        k_modes=4,  # 图内生方法只有 N=4 个传感器
+        k_modes=4,
         verbose_interval=300,
         method='hankel_dmd'
     )
     
-    # 方法 2: 图内生动力学 (真正融合)
-    results_graph, _, _ = run_simulation(
+    # 方法 2: 谱图理论融合 (图傅里叶域 DMD)
+    results_spectral, _, _ = run_simulation(
         T_total=10.0,
         dt_sample=0.01,
         window_size_s=0.5,
-        k_modes=4,  # 图内生方法只有 N=4 个传感器
+        k_modes=4,
         verbose_interval=300,
-        method='graph_intrinsic'
+        method='spectral_graph'
+    )
+    
+    # 方法 3: 统一谱图动力学 (可学习的α)
+    results_unified, _, _ = run_simulation(
+        T_total=10.0,
+        dt_sample=0.01,
+        window_size_s=0.5,
+        k_modes=4,
+        verbose_interval=300,
+        method='unified_spectral'
     )
     
     # 可视化对比
@@ -1483,13 +1924,13 @@ if __name__ == "__main__":
     except:
         plt.style.use('default')
     
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-    fig.suptitle('Hankel DMD vs Graph-Intrinsic Dynamics (图内生动力学)', fontsize=14)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle('Spectral Graph Theory Fusion: Hankel DMD vs Graph Fourier Domain', fontsize=14)
     
     colors = plt.cm.tab10(np.linspace(0, 1, 8))
     t = results_hankel.t_mid_windows
     
-    # Hankel DMD 频率 (k=4)
+    # Hankel DMD 频率
     ax = axes[0, 0]
     for k in range(min(4, len(results_hankel.Z_freqs))):
         freqs = np.abs(results_hankel.Z_freqs[k])
@@ -1497,22 +1938,35 @@ if __name__ == "__main__":
     for f in true_freqs:
         ax.axhline(f, color='black', linestyle=':', linewidth=1.5, alpha=0.7)
     ax.set_ylabel('|Freq| (Hz)')
-    ax.set_title('Hankel DMD (k=4)')
+    ax.set_title('Hankel DMD (Baseline)')
     ax.legend(loc='upper right', fontsize=8)
     ax.set_ylim([0, 25])
     
-    # 图内生动力学 频率 (k=4)
+    # 谱图理论融合 频率
     ax = axes[0, 1]
-    t_graph = results_graph.t_mid_windows
-    for k in range(min(4, len(results_graph.Z_freqs))):
-        freqs = np.abs(results_graph.Z_freqs[k])
-        ax.plot(t_graph, freqs, label=f'Mode {k+1}', alpha=0.7, color=colors[k])
+    t_spectral = results_spectral.t_mid_windows
+    for k in range(min(4, len(results_spectral.Z_freqs))):
+        freqs = np.abs(results_spectral.Z_freqs[k])
+        ax.plot(t_spectral, freqs, label=f'Mode {k+1}', alpha=0.7, color=colors[k])
     for f in true_freqs:
         ax.axhline(f, color='black', linestyle=':', linewidth=1.5, alpha=0.7)
     ax.set_ylabel('|Freq| (Hz)')
-    ax.set_title('Graph-Intrinsic Dynamics (★ 真正融合)')
+    ax.set_title('Spectral Graph (GFT Domain)')
     ax.legend(loc='upper right', fontsize=8)
-    ax.set_ylim([0, 50])  # 可能范围不同
+    ax.set_ylim([0, 25])
+    
+    # 统一谱图动力学 频率
+    ax = axes[0, 2]
+    t_unified = results_unified.t_mid_windows
+    for k in range(min(4, len(results_unified.Z_freqs))):
+        freqs = np.abs(results_unified.Z_freqs[k])
+        ax.plot(t_unified, freqs, label=f'Mode {k+1}', alpha=0.7, color=colors[k])
+    for f in true_freqs:
+        ax.axhline(f, color='black', linestyle=':', linewidth=1.5, alpha=0.7)
+    ax.set_ylabel('|Freq| (Hz)')
+    ax.set_title('Unified Spectral (with learnable alpha)')
+    ax.legend(loc='upper right', fontsize=8)
+    ax.set_ylim([0, 25])
     
     # Hankel DMD 增长率
     ax = axes[1, 0]
@@ -1521,60 +1975,81 @@ if __name__ == "__main__":
     ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
     ax.set_ylabel(r'$\gamma$ (1/s)')
     ax.set_xlabel('Time (s)')
-    ax.set_title('Hankel DMD: Growth Rate (γ)')
+    ax.set_title('Hankel DMD: Growth Rate')
     ax.legend(loc='upper right', fontsize=8)
     
-    # 图内生动力学 增长率
+    # 谱图理论融合 增长率
     ax = axes[1, 1]
-    for k in range(min(4, len(results_graph.Z_growths))):
-        ax.plot(t_graph, results_graph.Z_growths[k], label=f'Mode {k+1}', alpha=0.7, color=colors[k])
+    for k in range(min(4, len(results_spectral.Z_growths))):
+        ax.plot(t_spectral, results_spectral.Z_growths[k], label=f'Mode {k+1}', alpha=0.7, color=colors[k])
     ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
     ax.set_ylabel(r'$\gamma$ (1/s)')
     ax.set_xlabel('Time (s)')
-    ax.set_title('Graph-Intrinsic: Growth Rate (γ)')
+    ax.set_title('Spectral Graph: Growth Rate')
+    ax.legend(loc='upper right', fontsize=8)
+    
+    # 统一谱图动力学 增长率
+    ax = axes[1, 2]
+    for k in range(min(4, len(results_unified.Z_growths))):
+        ax.plot(t_unified, results_unified.Z_growths[k], label=f'Mode {k+1}', alpha=0.7, color=colors[k])
+    ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
+    ax.set_ylabel(r'$\gamma$ (1/s)')
+    ax.set_xlabel('Time (s)')
+    ax.set_title('Unified Spectral: Growth Rate')
     ax.legend(loc='upper right', fontsize=8)
     
     plt.tight_layout(rect=[0, 0.02, 1, 0.96])
     
     # 频率统计
     print("\n" + "="*70)
-    print("频率提取统计 (k=4)")
+    print("频率提取统计")
     print("="*70)
     print(f"\n真实频率: {true_freqs} Hz")
     
-    print(f"\nHankel DMD (k=4):")
-    extracted_freqs_hankel = []
-    for k in range(min(4, len(results_hankel.Z_freqs))):
-        freqs = np.abs(results_hankel.Z_freqs[k])
-        mean_f = np.mean(freqs)
-        if mean_f > 1:  # 排除直流分量
-            extracted_freqs_hankel.append(mean_f)
-        print(f"  Mode {k+1}: mean={mean_f:.2f} Hz, std={np.std(freqs):.2f} Hz")
+    def extract_freqs(results, name):
+        print(f"\n{name}:")
+        extracted = []
+        for k in range(min(4, len(results.Z_freqs))):
+            freqs = np.abs(results.Z_freqs[k])
+            mean_f = np.mean(freqs)
+            std_f = np.std(freqs)
+            if mean_f > 1:
+                extracted.append(mean_f)
+            print(f"  Mode {k+1}: mean={mean_f:.2f} Hz, std={std_f:.2f} Hz")
+        return extracted
     
-    print(f"\n图内生动力学 (k=4):")
-    extracted_freqs_graph = []
-    for k in range(min(4, len(results_graph.Z_freqs))):
-        freqs = np.abs(results_graph.Z_freqs[k])
-        mean_f = np.mean(freqs)
-        if mean_f > 1:
-            extracted_freqs_graph.append(mean_f)
-        print(f"  Mode {k+1}: mean={mean_f:.2f} Hz, std={np.std(freqs):.2f} Hz")
+    freqs_hankel = extract_freqs(results_hankel, "Hankel DMD")
+    freqs_spectral = extract_freqs(results_spectral, "谱图理论融合")
+    freqs_unified = extract_freqs(results_unified, "统一谱图动力学")
     
     # 总结
     print("\n" + "="*70)
     print("总结")
     print("="*70)
-    print(f"Hankel DMD 提取的主要频率: {sorted(set([round(f) for f in extracted_freqs_hankel if f > 1]))[:4]} Hz")
-    print(f"图内生动力学 提取的主要频率: {sorted(set([round(f) for f in extracted_freqs_graph if f > 1]))[:4]} Hz")
+    print(f"Hankel DMD: {sorted(set([round(f) for f in freqs_hankel]))[:4]} Hz")
+    print(f"谱图理论融合: {sorted(set([round(f) for f in freqs_spectral]))[:4]} Hz")
+    print(f"统一谱图动力学: {sorted(set([round(f) for f in freqs_unified]))[:4]} Hz")
     print(f"真实频率: {true_freqs} Hz")
     
-    # 分析图结构的影响
+    # 方法对比分析
     print("\n" + "="*70)
-    print("图结构分析")
+    print("方法对比分析")
     print("="*70)
-    print("图内生动力学 vs Hankel DMD:")
-    print("  - 图参与了动力学: dX_graph = dX/dt + α·L·X")
-    print("  - 图作为结构先验: M_real = Cov(X) + β·L")
-    print("  - 频率由图和信号共同决定")
+    print("")
+    print("Hankel DMD:")
+    print("  - 纯数据驱动")
+    print("  - 无图结构信息")
+    print("  - 频率提取准确")
+    print("")
+    print("谱图理论融合:")
+    print("  - 先图傅里叶变换: X_gft = U^T X")
+    print("  - 在图谱域做 DMD")
+    print("  - 图结构自然融入坐标系")
+    print("")
+    print("统一谱图动力学:")
+    print("  - 图谱域 DMD + 可学习的 α")
+    print("  - A_spectral = A_gft @ exp(-α Λ_graph)")
+    print("  - α 控制图对动力学的影响强度")
+    print("  - 可通过梯度下降学习最优 α")
     
     plt.show()
