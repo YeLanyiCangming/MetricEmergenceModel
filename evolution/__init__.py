@@ -3,15 +3,14 @@
 核心范式（第一性原理）：
   数据 (x) → 抽象状态 (z) → 度规 g(z) → 联络 Γ (涌现) → 运动法则 (涌现)
 
-三层架构：
-  1. 感知层：学习流形的"本体"——度规张量
-  2. 涌现层：从度规自动推导联络（Christoffel符号）
-  3. 法则层：测地线加速度 + 外力 → 完整运动
-
-不硬编码规则，但硬编码几何原理（微分几何的语言）
+世界动力学 (N·ẍ + D·ẋ + K·x = F(t))：
+  - N = 质量矩阵（惯性）
+  - D = 阻尼矩阵（耗散）
+  - K = 刚度矩阵 = diag(ω²) + β·L（本地频率 + 图耦合）
+  - F(t) = 外部驱动
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .model import (
     MetricEvolutionModel,
@@ -24,8 +23,17 @@ from .model import (
     RMSNorm,
 )
 
+from .world_dynamics import (
+    WorldDynamics,
+    WorldDynamicsLayer,
+    build_world_dynamics,
+    solve_conservative_modes,
+    solve_damped_modes,
+)
+
 __all__ = [
     '__version__',
+    # 度规演化模型
     'MetricEvolutionModel',
     'StateEncoder',
     'MetricEncoder',
@@ -34,4 +42,10 @@ __all__ = [
     'ExternalForce',
     'ProbabilisticDecoder',
     'RMSNorm',
+    # 世界动力学
+    'WorldDynamics',
+    'WorldDynamicsLayer',
+    'build_world_dynamics',
+    'solve_conservative_modes',
+    'solve_damped_modes',
 ]
