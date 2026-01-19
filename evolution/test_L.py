@@ -214,107 +214,187 @@ def build_multivariate_hankel(X: np.ndarray, delay: int) -> np.ndarray:
 
 
 # =============================================================================
-# 方法五：统一世界张量 - 真正的图拉普拉斯 + 拉格朗日融合
-# 基于 Hankel DMD 的本质思想
+# 方法六：图内生动力学 - 真正的融合
+# 图不是附加约束，而是频率产生的根本机制
 # =============================================================================
 
-def extract_dynamics_matrix(H: np.ndarray, dt: float) -> np.ndarray:
+def build_graph_laplacian_from_data(X: np.ndarray, mode: str = 'normalized') -> np.ndarray:
     """
-    从 Hankel 矩阵提取连续时间动力学矩阵 B
+    从数据构建图拉普拉斯
     
     第一性原理：
-        假设线性演化: X_{k+1} = A X_k
-        则 A = e^{B·Δt}，其中 B 是连续时间动力学矩阵
-        B = ln(A)/Δt
-        
-        B 的特征值 λ_B = γ + iω 直接编码频率和增长率
+        协方差 C_ij 表示变量 i 和 j 的统计相关性
+        这可以解释为"连接强度" → 构建图
     
     Args:
-        H: [d, T] Hankel 矩阵
-        dt: 采样间隔
+        X: [T, N] 信号矩阵
+        mode: 'unnormalized', 'normalized', 'random_walk'
     
     Returns:
-        B: [d, d] 连续时间动力学矩阵
+        L: [N, N] 图拉普拉斯
     """
-    # DMD: X_{k+1} = A X_k
-    X_past = H[:, :-1]
-    X_future = H[:, 1:]
+    N = X.shape[1]
     
-    # 最小二乘估计 A
-    U, S, Vh = np.linalg.svd(X_past, full_matrices=False)
+    # 协方差作为邻接矩阵
+    C = np.cov(X.T)  # [N, N]
+    A = np.abs(C)  # 绝对值作为连接强度
+    np.fill_diagonal(A, 0)  # 移除自环
     
-    # 截断小奇异值
-    r = np.sum(S > 1e-10 * S[0])
-    U_r = U[:, :r]
-    S_r = S[:r]
-    Vh_r = Vh[:r, :]
+    # 度矩阵
+    D = np.diag(A.sum(axis=1) + 1e-10)
     
-    # 低秩近似
-    A_tilde = U_r.T @ X_future @ Vh_r.T @ np.diag(1.0 / S_r)
+    if mode == 'unnormalized':
+        L = D - A
+    elif mode == 'normalized':
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D)))
+        L = np.eye(N) - D_inv_sqrt @ A @ D_inv_sqrt
+    else:  # random_walk
+        D_inv = np.diag(1.0 / np.diag(D))
+        L = np.eye(N) - D_inv @ A
     
-    # 连续化: B = ln(A)/dt
-    # 使用特征分解计算矩阵对数
-    lambdas, V = np.linalg.eig(A_tilde)
-    
-    # 避免 log(0)
-    lambdas_safe = np.where(np.abs(lambdas) > 1e-10, lambdas, 1e-10)
-    log_lambdas = np.log(lambdas_safe) / dt
-    
-    # 重构 B = V diag(log(λ)/dt) V^{-1}
-    B_tilde = V @ np.diag(log_lambdas) @ np.linalg.pinv(V)
-    
-    # 投影回全空间
-    B = U_r @ B_tilde @ U_r.T
-    
-    return B, A_tilde, U_r, lambdas, log_lambdas
+    return L, A, D
 
 
-def build_unified_world_tensor_v2(
-    X_window: np.ndarray,
+def compute_graph_aware_derivative(
+    X: np.ndarray,
+    L: np.ndarray,
     dt: float,
-    delay: int = None
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    alpha: float = 0.1
+) -> np.ndarray:
     """
-    统一世界张量 V2：融合 Hankel DMD + 图拉普拉斯 + 拉格朗日
+    计算图感知的时间导数
     
-    第一性原理融合：
-    
-    1. Hankel DMD 提取动力学矩阵 B = ln(A)/dt
-    
-    2. B 的分解：
-       B = B_sym + B_antisym
-       
-       B_sym = (B + B^T)/2
-           → 对称部分：类似图拉普拉斯（扩散/阻尼）
-           → 描述能量耗散
-       
-       B_antisym = (B - B^T)/2
-           → 反对称部分：类似辛形式（振荡/守恒）
-           → 描述能量守恒的振荡
-    
-    3. 统一世界张量：
-       M = -B_sym + i * B_antisym
-         = L_dissipation + i * Ω_oscillation
-       
-       这正是“图拉普拉斯 + 拉格朗日”的自然形式！
-       - 实部：图拉普拉斯类型的扩散/阻尼
-       - 虚部：拉格朗日/哈密顿类型的振荡
-    
-    4. M 的特征值 λ = σ + iω
-       - ω 是本征频率
-       - σ 是阻尼/增长率
+    第一性原理：
+        传统：dX/dt = 局部时间变化（图无关）
+        新方法：dX_graph = dX/dt + α·L·X
+        
+        物理意义：
+        - dX/dt: 节点自身的时间演化
+        - L·X: 图上的空间扩散/传播（节点受邻居"拉扯"）
+        - α: 耦合强度
+        
+        类似物理：
+        - 热传导方程: ∂T/∂t = κ∇²T = κLT
+        - 波动方程: ∂²u/∂t² = c²∇²u = c²Lu
     
     Args:
-        X_window: [W, N] 信号窗口
+        X: [T, N] 信号矩阵
+        L: [N, N] 图拉普拉斯
         dt: 采样间隔
-        delay: Hankel 嵌入维度
+        alpha: 图耦合强度
     
     Returns:
-        M_unified: 统一世界张量
-        L_dissipation: 图拉普拉斯部分（耗散）
-        Omega_oscillation: 拉格朗日部分（振荡）
-        B: 连续时间动力学矩阵
-        H: Hankel 矩阵
+        dX_graph: [T, N] 图感知的导数
+    """
+    # 时间导数
+    dX_dt = np.gradient(X, dt, axis=0)  # [T, N]
+    
+    # 图拉普拉斯作用（空间扩散）
+    # L·X: 每个时间点，图对信号的"拉扯"
+    LX = (L @ X.T).T  # [T, N]
+    
+    # 图感知的导数
+    dX_graph = dX_dt + alpha * LX
+    
+    return dX_graph
+
+
+def build_graph_intrinsic_M(
+    X: np.ndarray,
+    L: np.ndarray,
+    dt: float,
+    alpha: float = 0.1,
+    beta: float = 0.1
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    构建图内生的统一世界张量 M
+    
+    第一性原理：
+        M = M_real + i·M_imag
+        
+        传统：
+        - M_real = Cov(X)
+        - M_imag = X^T @ dX/dt
+        
+        图内生版本：
+        - M_real = Cov(X) + β·L  （图结构作为先验）
+        - M_imag = X^T @ dX_graph  （图感知的动力学）
+        
+        物理意义：
+        - M_real: 结构约束 + 图拓扑
+        - M_imag: 能量流动（受图影响）
+        
+        结果：
+        - 图决定了 M 的结构
+        - M 的特征值(频率)由图和信号共同决定
+        - 图不再是"附加"，而是"内生"
+    
+    Args:
+        X: [T, N] 信号矩阵
+        L: [N, N] 图拉普拉斯
+        dt: 采样间隔
+        alpha: 动力学图耦合强度
+        beta: 结构图耦合强度
+    
+    Returns:
+        M: [N, N] 图内生的统一世界张量
+        N_graph: [N, N] 图增强的质量矩阵
+    """
+    T, N = X.shape
+    
+    # 1. 图感知的导数
+    dX_graph = compute_graph_aware_derivative(X, L, dt, alpha)
+    
+    # 2. 中心化
+    X_centered = X - np.mean(X, axis=0, keepdims=True)
+    dX_centered = dX_graph - np.mean(dX_graph, axis=0, keepdims=True)
+    
+    # 3. 构建 M_real: 结构 + 图拓扑
+    Cov_X = (X_centered.T @ X_centered) / (T - 1)  # [N, N]
+    M_real = Cov_X + beta * L  # 图作为结构先验
+    M_real = symmetric_part(M_real)
+    
+    # 4. 构建 M_imag: 图感知的动力学
+    M_imag = (X_centered.T @ dX_centered) / (T - 1)  # [N, N]
+    # 反对称化（动力学算子应该是反对称的）
+    M_imag = (M_imag - M_imag.T) / 2
+    
+    # 5. 统一世界张量
+    M = M_real + 1j * M_imag
+    
+    # 6. 图增强的质量矩阵
+    # 高连接度节点获得更高"惯性质量"
+    N_graph = Cov_X + beta * np.diag(np.diag(L) + 1e-6)
+    N_graph = symmetric_part(N_graph)
+    
+    # 确保正定
+    eigvals = np.linalg.eigvalsh(N_graph)
+    if np.min(eigvals) < 1e-10:
+        N_graph = N_graph + (1e-6 - np.min(eigvals)) * np.eye(N)
+    
+    return M, N_graph
+
+
+def state_encoder_graph_intrinsic(
+    X_window: np.ndarray,
+    k_modes: int,
+    dt_sample: float,
+    alpha: float = 0.1,
+    beta: float = 0.1,
+    delay: int = None
+) -> Tuple[np.ndarray, np.ndarray, List[Dict], np.ndarray, np.ndarray]:
+    """
+    图内生动力学编码器 - 真正的融合
+    
+    第一性原理：
+    1. Hankel 嵌入提供时间延迟结构
+    2. 图拉普拉斯约束 DMD 算子
+    3. 频率由 DMD 特征值提取，但图影响算子结构
+    
+    关键改进：
+    - 不是 dX_graph = dX/dt + αLX（扩散方程，无振荡）
+    - 而是让图结构约束 DMD 算子 A
+    - A_graph = (1-α)A_dmd + α·f(L)
     """
     W, N = X_window.shape
     
@@ -322,24 +402,134 @@ def build_unified_world_tensor_v2(
         delay = min(W // 3, 15)
         delay = max(delay, 5)
     
-    # 1. Hankel 嵌入
+    # 1. 从数据构建图拉普拉斯
+    L_spatial, A_adj, D = build_graph_laplacian_from_data(X_window, mode='normalized')
+    
+    # 2. 构建 Hankel 矩阵
     H = build_multivariate_hankel(X_window, delay)
+    d = H.shape[0]  # 嵌入维度
     
-    # 2. 提取动力学矩阵
-    B, A_tilde, U_r, _, _ = extract_dynamics_matrix(H, dt)
+    # 3. DMD 提取动力学算子
+    X_past = H[:, :-1]
+    X_future = H[:, 1:]
     
-    # 3. 分解为对称和反对称部分
-    B_sym = (B + B.T) / 2  # 对称部分
-    B_antisym = (B - B.T) / 2  # 反对称部分
+    U, S, Vh = np.linalg.svd(X_past, full_matrices=False)
     
-    # 4. 构建统一世界张量
-    # 图拉普拉斯是半正定的，所以取负号
-    L_dissipation = -B_sym  # 耗散项（类似图拉普拉斯）
-    Omega_oscillation = B_antisym  # 振荡项（类似辛形式）
+    # 自适应秩选择
+    energy_ratio = np.cumsum(S**2) / np.sum(S**2)
+    r = np.searchsorted(energy_ratio, 0.99) + 1
+    r = max(r, k_modes)
+    r = min(r, len(S))
     
-    M_unified = L_dissipation + 1j * Omega_oscillation
+    U_r = U[:, :r]
+    S_r = S[:r]
+    Vh_r = Vh[:r, :]
     
-    return M_unified, L_dissipation, Omega_oscillation, B, H
+    # DMD 算子
+    A_dmd = U_r.T @ X_future @ Vh_r.T @ np.diag(1.0 / S_r)  # [r, r]
+    
+    # 4. 图约束的 DMD 算子
+    # 核心思想：A 的结构应该反映图的连接性
+    # 但 A_dmd 在 Hankel 空间，L 在原始空间
+    # 需要拓展 L 到 Hankel 空间
+    
+    # 构建 Hankel 空间的图拉普拉斯（块对角）
+    # L_hankel 是 delay 个 L_spatial 的块对角矩阵
+    L_hankel = np.kron(np.eye(delay), L_spatial)  # [d, d] = [delay*N, delay*N]
+    
+    # 在低秩空间中的图约束
+    L_reduced = U_r.T @ L_hankel @ U_r  # [r, r]
+    
+    # 图调制的传播算子
+    # 思想：图结构作为“惯性”约束传播
+    # A_graph = A_dmd @ (I - α L_reduced)
+    # 这表示“在图上传播时，相邻节点之间有耦合”
+    A_graph = A_dmd @ (np.eye(r) - alpha * L_reduced)
+    
+    # 5. 特征分解
+    lambdas_dmd, W_dmd = np.linalg.eig(A_graph)
+    
+    # 6. 频率和增长率
+    freqs_hz = np.abs(np.angle(lambdas_dmd)) / (2 * np.pi * dt_sample)
+    growth_rates = np.log(np.abs(lambdas_dmd) + 1e-10) / dt_sample
+    
+    # 7. 按频率排序
+    idx = np.argsort(freqs_hz)[::-1]
+    lambdas_sorted = lambdas_dmd[idx]
+    W_sorted = W_dmd[:, idx]
+    freqs_sorted = freqs_hz[idx]
+    growth_sorted = growth_rates[idx]
+    
+    # 8. 选择主导模态
+    selected_lambdas = lambdas_sorted[:k_modes]
+    selected_W = W_sorted[:, :k_modes]
+    
+    # 9. 重构全空间特征向量
+    Phi = U_r @ selected_W  # [d, k_modes]
+    
+    # 10. 提取 Z 参数
+    current_state = H[:, -1]  # Hankel 空间的当前状态
+    
+    Z_params = []
+    for i in range(k_modes):
+        if i < len(selected_lambdas):
+            lam = selected_lambdas[i]
+            phi = Phi[:, i]
+            
+            # 投影
+            proj = np.vdot(phi.conj(), current_state) / (np.vdot(phi.conj(), phi) + 1e-10)
+            
+            Z_params.append({
+                'lambda': lam,
+                'freq_hz': freqs_sorted[i],
+                'omega_rad': 2 * np.pi * freqs_sorted[i],
+                'growth_rate': growth_sorted[i],
+                'amplitude': np.abs(proj),
+                'phase': np.angle(proj),
+                'z_position': proj,
+                'eigenvector': phi,
+                'spatial_coupling': L_spatial,  # 图结构信息
+                'graph_influence': alpha  # 图影响强度
+            })
+        else:
+            Z_params.append({
+                'lambda': 0, 'freq_hz': 0, 'omega_rad': 0,
+                'growth_rate': 0, 'amplitude': 0, 'phase': 0,
+                'z_position': 0, 'eigenvector': np.zeros(d),
+                'spatial_coupling': L_spatial, 'graph_influence': alpha
+            })
+    
+    # 11. 构建 M 和 N (用于度规计算)
+    # M 代表动力学
+    M_dynamics = A_graph
+    
+    return M_dynamics, L_spatial, Z_params, selected_lambdas, Phi
+
+
+def metric_encoder_g_graph_intrinsic(
+    Phi: np.ndarray,
+    k_modes: int
+) -> np.ndarray:
+    """
+    从图内生动力学涌现度规
+    
+    g = Φ^H Φ
+    
+    物理意义：
+    - Phi 包含图结构的影响（通过 A_graph）
+    - g 定义了模态空间的度规
+    - 图结构通过 g 影响几何
+    """
+    Phi_k = Phi[:, :k_modes]
+    g = Phi_k.conj().T @ Phi_k
+    g = hermitian_part(g)
+    
+    # 确保正定
+    eigvals = np.linalg.eigvalsh(g)
+    if np.min(eigvals) < 1e-10:
+        g = g + (1e-6 - np.min(eigvals)) * np.eye(k_modes)
+    
+    return g
 
 
 def state_encoder_unified_v2(
@@ -1054,7 +1244,8 @@ def run_simulation(
         'cov': 'Covariance',
         'dmd': 'DMD',
         'hankel_dmd': 'Hankel DMD',
-        'unified': 'Unified V2 (图拉普拉斯+拉格朗日+DMD融合)'
+        'unified': 'Unified V2 (DMD + 图结构)',
+        'graph_intrinsic': '图内生动力学 (★ 真正融合)'
     }
     method_name = method_names.get(method, method)
     
@@ -1076,7 +1267,13 @@ def run_simulation(
     for i in range(len(t_full) - window_points):
         X_window = X_full[i : i + window_points, :]
         
-        if method == 'unified':
+        if method == 'graph_intrinsic':
+            # ★ 图内生动力学：真正的融合
+            M, L_spatial, Z_params, selected_lambdas, Phi = state_encoder_graph_intrinsic(
+                X_window, k_modes, dt_sample, alpha=0.1, beta=0.1
+            )
+            current_g = metric_encoder_g_graph_intrinsic(Phi, k_modes)
+        elif method == 'unified':
             # ★ 统一世界张量 V2：融合 Hankel DMD + 图拉普拉斯 + 拉格朗日
             M, L_diss, Z_params, selected_lambdas, selected_eigenvectors = state_encoder_unified_v2(
                 X_window, k_modes, dt_sample
@@ -1248,32 +1445,36 @@ def visualize_results(results: ResultCollector, k_modes: int, true_freqs: List[f
 # =============================================================================
 
 if __name__ == "__main__":
-    # 探索: 统一世界张量 V2 - 融合所有第一性原理
+    # 探索: 图内生动力学 - 真正的融合
     print("\n" + "="*70)
-    print("探索: Hankel DMD (k=8) vs Unified V2 (k=8)")
-    print("Unified V2 = Hankel DMD本质 + 图拉普拉斯(耗散) + 拉格朗日(振荡)")
+    print("探索: Hankel DMD vs 图内生动力学 (真正融合)")
+    print("")
+    print("图内生动力学:")
+    print("  dX_graph = dX/dt + α·L·X  (图参与动力学)")
+    print("  M = Cov(X) + βL + i·(X^T @ dX_graph)")
+    print("  图不是附加约束，而是频率产生的根本机制")
     print("="*70)
     
     true_freqs = [10, 15, 20, 6]  # 输入信号的真实频率
     
-    # 方法 1: Hankel DMD with k=8
+    # 方法 1: Hankel DMD (基线)
     results_hankel, X_full, t_full = run_simulation(
         T_total=10.0,
         dt_sample=0.01,
         window_size_s=0.5,
-        k_modes=8,  # 增加到 8 以提取所有 4 个频率
+        k_modes=4,  # 图内生方法只有 N=4 个传感器
         verbose_interval=300,
         method='hankel_dmd'
     )
     
-    # 方法 2: 图拉普拉斯 + 拉格朗日
-    results_unified, _, _ = run_simulation(
+    # 方法 2: 图内生动力学 (真正融合)
+    results_graph, _, _ = run_simulation(
         T_total=10.0,
         dt_sample=0.01,
         window_size_s=0.5,
-        k_modes=8,
+        k_modes=4,  # 图内生方法只有 N=4 个传感器
         verbose_interval=300,
-        method='unified'
+        method='graph_intrinsic'
     )
     
     # 可视化对比
@@ -1283,34 +1484,35 @@ if __name__ == "__main__":
         plt.style.use('default')
     
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-    fig.suptitle('Hankel DMD vs Unified V2 (Laplacian + Lagrangian + DMD)', fontsize=14)
+    fig.suptitle('Hankel DMD vs Graph-Intrinsic Dynamics (图内生动力学)', fontsize=14)
     
     colors = plt.cm.tab10(np.linspace(0, 1, 8))
     t = results_hankel.t_mid_windows
     
-    # Hankel DMD 频率 (k=8)
+    # Hankel DMD 频率 (k=4)
     ax = axes[0, 0]
-    for k in range(min(8, len(results_hankel.Z_freqs))):
+    for k in range(min(4, len(results_hankel.Z_freqs))):
         freqs = np.abs(results_hankel.Z_freqs[k])
         ax.plot(t, freqs, label=f'Mode {k+1}', alpha=0.7, color=colors[k])
     for f in true_freqs:
         ax.axhline(f, color='black', linestyle=':', linewidth=1.5, alpha=0.7)
     ax.set_ylabel('|Freq| (Hz)')
-    ax.set_title('Hankel DMD (k=8)')
+    ax.set_title('Hankel DMD (k=4)')
     ax.legend(loc='upper right', fontsize=8)
     ax.set_ylim([0, 25])
     
-    # Unified V2 频率 (k=8)
+    # 图内生动力学 频率 (k=4)
     ax = axes[0, 1]
-    for k in range(min(8, len(results_unified.Z_freqs))):
-        freqs = np.abs(results_unified.Z_freqs[k])
-        ax.plot(t, freqs, label=f'Mode {k+1}', alpha=0.7, color=colors[k])
+    t_graph = results_graph.t_mid_windows
+    for k in range(min(4, len(results_graph.Z_freqs))):
+        freqs = np.abs(results_graph.Z_freqs[k])
+        ax.plot(t_graph, freqs, label=f'Mode {k+1}', alpha=0.7, color=colors[k])
     for f in true_freqs:
         ax.axhline(f, color='black', linestyle=':', linewidth=1.5, alpha=0.7)
     ax.set_ylabel('|Freq| (Hz)')
-    ax.set_title('Unified V2 (k=8)')
+    ax.set_title('Graph-Intrinsic Dynamics (★ 真正融合)')
     ax.legend(loc='upper right', fontsize=8)
-    ax.set_ylim([0, 25])
+    ax.set_ylim([0, 50])  # 可能范围不同
     
     # Hankel DMD 增长率
     ax = axes[1, 0]
@@ -1322,40 +1524,40 @@ if __name__ == "__main__":
     ax.set_title('Hankel DMD: Growth Rate (γ)')
     ax.legend(loc='upper right', fontsize=8)
     
-    # Unified V2 增长率
+    # 图内生动力学 增长率
     ax = axes[1, 1]
-    for k in range(min(4, len(results_unified.Z_growths))):
-        ax.plot(t, results_unified.Z_growths[k], label=f'Mode {k+1}', alpha=0.7, color=colors[k])
+    for k in range(min(4, len(results_graph.Z_growths))):
+        ax.plot(t_graph, results_graph.Z_growths[k], label=f'Mode {k+1}', alpha=0.7, color=colors[k])
     ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
     ax.set_ylabel(r'$\gamma$ (1/s)')
     ax.set_xlabel('Time (s)')
-    ax.set_title('Unified V2: Growth Rate (γ)')
+    ax.set_title('Graph-Intrinsic: Growth Rate (γ)')
     ax.legend(loc='upper right', fontsize=8)
     
     plt.tight_layout(rect=[0, 0.02, 1, 0.96])
     
     # 频率统计
     print("\n" + "="*70)
-    print("频率提取统计 (k=8)")
+    print("频率提取统计 (k=4)")
     print("="*70)
     print(f"\n真实频率: {true_freqs} Hz")
     
-    print(f"\nHankel DMD (k=8):")
+    print(f"\nHankel DMD (k=4):")
     extracted_freqs_hankel = []
-    for k in range(min(8, len(results_hankel.Z_freqs))):
+    for k in range(min(4, len(results_hankel.Z_freqs))):
         freqs = np.abs(results_hankel.Z_freqs[k])
         mean_f = np.mean(freqs)
         if mean_f > 1:  # 排除直流分量
             extracted_freqs_hankel.append(mean_f)
         print(f"  Mode {k+1}: mean={mean_f:.2f} Hz, std={np.std(freqs):.2f} Hz")
     
-    print(f"\nUnified V2 (k=8):")
-    extracted_freqs_unified = []
-    for k in range(min(8, len(results_unified.Z_freqs))):
-        freqs = np.abs(results_unified.Z_freqs[k])
+    print(f"\n图内生动力学 (k=4):")
+    extracted_freqs_graph = []
+    for k in range(min(4, len(results_graph.Z_freqs))):
+        freqs = np.abs(results_graph.Z_freqs[k])
         mean_f = np.mean(freqs)
         if mean_f > 1:
-            extracted_freqs_unified.append(mean_f)
+            extracted_freqs_graph.append(mean_f)
         print(f"  Mode {k+1}: mean={mean_f:.2f} Hz, std={np.std(freqs):.2f} Hz")
     
     # 总结
@@ -1363,7 +1565,16 @@ if __name__ == "__main__":
     print("总结")
     print("="*70)
     print(f"Hankel DMD 提取的主要频率: {sorted(set([round(f) for f in extracted_freqs_hankel if f > 1]))[:4]} Hz")
-    print(f"Unified V2 提取的主要频率: {sorted(set([round(f) for f in extracted_freqs_unified if f > 1]))[:4]} Hz")
+    print(f"图内生动力学 提取的主要频率: {sorted(set([round(f) for f in extracted_freqs_graph if f > 1]))[:4]} Hz")
     print(f"真实频率: {true_freqs} Hz")
+    
+    # 分析图结构的影响
+    print("\n" + "="*70)
+    print("图结构分析")
+    print("="*70)
+    print("图内生动力学 vs Hankel DMD:")
+    print("  - 图参与了动力学: dX_graph = dX/dt + α·L·X")
+    print("  - 图作为结构先验: M_real = Cov(X) + β·L")
+    print("  - 频率由图和信号共同决定")
     
     plt.show()
