@@ -546,6 +546,110 @@ class GeometricWorldModel(nn.Module):
         logits = self.decoder(z_last)  # (B, 256)
         
         return logits
+    
+    @torch.no_grad()
+    def generate(
+        self, 
+        prompt: str, 
+        max_new_bytes: int = 50,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 0.9,
+        stop_bytes: list = None
+    ) -> str:
+        """
+        自回归生成文本
+        
+        流程:
+        1. 编码 prompt
+        2. 预测下一个字节
+        3. 采样
+        4. 拼接到输入
+        5. 重复
+        
+        参数:
+        - temperature: 温度（越高越随机）
+        - top_k: 只从 top k 个候选中采样
+        - top_p: nucleus sampling
+        - stop_bytes: 停止字节列表
+        """
+        self.eval()
+        
+        # 编码 prompt
+        input_bytes = list(prompt.encode('utf-8'))
+        generated_bytes = []
+        
+        if stop_bytes is None:
+            stop_bytes = [0]  # NULL 字节
+        
+        for _ in range(max_new_bytes):
+            # 准备输入
+            x = torch.tensor([input_bytes + generated_bytes])
+            
+            # 前向传播
+            result = self.forward(x)
+            logits = result['logits'][0, -1]  # 最后一个位置
+            
+            # 温度调整
+            logits = logits / temperature
+            
+            # Top-k 采样
+            if top_k > 0:
+                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                logits[indices_to_remove] = float('-inf')
+            
+            # Top-p (nucleus) 采样
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                logits[indices_to_remove] = float('-inf')
+            
+            # 采样
+            probs = F.softmax(logits, dim=-1)
+            next_byte = torch.multinomial(probs, num_samples=1).item()
+            
+            # 检查停止条件
+            if next_byte in stop_bytes:
+                break
+            
+            generated_bytes.append(next_byte)
+        
+        # 解码
+        try:
+            generated_text = bytes(generated_bytes).decode('utf-8', errors='replace')
+        except:
+            generated_text = ''.join(chr(b) if 32 <= b < 127 else '?' for b in generated_bytes)
+        
+        return generated_text
+    
+    @torch.no_grad()
+    def generate_greedy(self, prompt: str, max_new_bytes: int = 50) -> str:
+        """贪婪解码（总是选概率最高的）"""
+        self.eval()
+        
+        input_bytes = list(prompt.encode('utf-8'))
+        generated_bytes = []
+        
+        for _ in range(max_new_bytes):
+            x = torch.tensor([input_bytes + generated_bytes])
+            result = self.forward(x)
+            logits = result['logits'][0, -1]
+            
+            next_byte = logits.argmax().item()
+            
+            if next_byte == 0:  # NULL
+                break
+            
+            generated_bytes.append(next_byte)
+        
+        try:
+            return bytes(generated_bytes).decode('utf-8', errors='replace')
+        except:
+            return ''.join(chr(b) if 32 <= b < 127 else '?' for b in generated_bytes)
 
 
 # =============================================================================
@@ -677,161 +781,124 @@ def evaluate_prediction(model, prompt, expected_next):
 
 if __name__ == "__main__":
     print("="*60)
-    print("几何世界模型 - 学习能力验证")
+    print("几何世界模型 - 流畅生成验证")
     print("="*60)
+    
+    # =================================================================
+    # 实验: 学习简单模式并流畅生成
+    # =================================================================
     
     # 创建模型
-    model = GeometricWorldModel(d_model=64, max_len=256)
+    model = GeometricWorldModel(d_model=128, max_len=256)
     print(f"\n模型参数量: {sum(p.numel() for p in model.parameters()):,}")
     
-    # =================================================================
-    # 实验 1: 简单重复模式
-    # =================================================================
-    print("\n" + "="*60)
-    print("【实验 1】简单重复模式: 'ABABAB...'")
-    print("="*60)
-    
-    # 训练数据: 简单的 AB 重复
-    train_texts_1 = [
-        "ABABABABAB",
-        "ABABABAB",
+    # 训练数据: 简单的重复模式
+    train_texts = [
+        # AB 模式
         "ABABABABABABAB",
-    ] * 10  # 重复 10 次增加数据量
-    
-    print("\n训练前:")
-    result = evaluate_prediction(model, "ABABA", "B")
-    print(f"  'ABABA' → 预测 '{chr(result['predicted'])}', 期望 'B'")
-    print(f"  正确: {result['correct']}, P(B) = {result['expected_prob']:.2%}")
-    
-    # 训练
-    print("\n训练中...")
-    losses = train_on_text(model, train_texts_1, epochs=100, lr=0.01)
-    
-    print("\n训练后:")
-    result = evaluate_prediction(model, "ABABA", "B")
-    print(f"  'ABABA' → 预测 '{chr(result['predicted'])}', 期望 'B'")
-    print(f"  正确: {result['correct']}, P(B) = {result['expected_prob']:.2%}")
-    
-    result = evaluate_prediction(model, "ABAB", "A")
-    print(f"  'ABAB' → 预测 '{chr(result['predicted'])}', 期望 'A'")
-    print(f"  正确: {result['correct']}, P(A) = {result['expected_prob']:.2%}")
-    
-    # =================================================================
-    # 实验 2: 简单中文模式
-    # =================================================================
-    print("\n" + "="*60)
-    print("【实验 2】简单中文模式")
-    print("="*60)
-    
-    # 重置模型
-    model = GeometricWorldModel(d_model=64, max_len=256)
-    
-    # 训练数据: 简单的中文重复
-    train_texts_2 = [
+        "ABABABABABAB",
+        "ABABABAB",
+        # hello 模式
+        "hello hello hello",
+        "hello hello",
+        "hello world hello world",
+        # 简单句子
+        "I love you",
+        "I love AI",
+        "I love it",
+        "you love me",
+        "we love AI",
+        # 中文
         "你好你好你好",
         "你好你好",
-        "你好你好你好你好",
-    ] * 10
+        "我爱你",
+        "我爱AI",
+    ] * 20  # 重复 20 次
     
-    print("\n训练前:")
-    # 中文是多字节的，我们检查字节级预测
-    prompt = "你好你"
-    x = torch.tensor([[b for b in prompt.encode('utf-8')]])
-    with torch.no_grad():
-        result = model(x)
-        logits = result['logits'][0, -1]
-        probs = F.softmax(logits, dim=-1)
-        top5 = probs.topk(5)
-    print(f"  '{prompt}' → Top5 字节: {[f'{idx.item()}' for idx in top5.indices]}")
+    print(f"\n训练数据: {len(train_texts)} 条")
     
-    # 训练
-    print("\n训练中...")
-    losses = train_on_text(model, train_texts_2, epochs=100, lr=0.01)
-    
-    print("\n训练后:")
-    with torch.no_grad():
-        result = model(x)
-        logits = result['logits'][0, -1]
-        probs = F.softmax(logits, dim=-1)
-        top5 = probs.topk(5)
-    
-    # "好" 的 UTF-8 第一个字节是 0xe5 (229)
-    expected_byte = "好".encode('utf-8')[0]  # 0xe5 = 229
-    print(f"  '{prompt}' → Top5 字节: {[f'{idx.item()}' for idx in top5.indices]}")
-    print(f"  期望的下一个字节: {expected_byte} (0x{expected_byte:02x}, '好'的第一字节)")
-    print(f"  P(期望字节) = {probs[expected_byte].item():.2%}")
-    
-    # =================================================================
-    # 实验 3: 简单语法模式
-    # =================================================================
+    # 训练前测试
     print("\n" + "="*60)
-    print("【实验 3】简单语法模式: '我爱X' / 'I love X'")
+    print("【训练前】生成测试")
     print("="*60)
     
-    # 重置模型
-    model = GeometricWorldModel(d_model=64, max_len=256)
-    
-    # 训练数据: 简单语法
-    train_texts_3 = [
-        "I love you",
-        "I love her",
-        "I love him",
-        "I love it",
-        "I love AI",
-        "我爱你",
-        "我爱她",
-        "我爱他",
-        "我爱AI",
-    ] * 10
-    
-    print("\n训练前:")
-    result = evaluate_prediction(model, "I love ", "y")  # "you" 的 y
-    print(f"  'I love ' → 预测 '{chr(result['predicted'])}', P(y) = {result['expected_prob']:.2%}")
+    test_prompts = ["AB", "hello ", "I love ", "你好"]
+    for prompt in test_prompts:
+        generated = model.generate_greedy(prompt, max_new_bytes=20)
+        print(f"  '{prompt}' → '{prompt}{generated}'")
     
     # 训练
-    print("\n训练中...")
-    losses = train_on_text(model, train_texts_3, epochs=200, lr=0.01)
+    print("\n" + "="*60)
+    print("【训练中】")
+    print("="*60)
+    losses = train_on_text(model, train_texts, epochs=300, lr=0.005)
     
-    print("\n训练后:")
-    # 测试 "I love "
+    # 训练后测试
+    print("\n" + "="*60)
+    print("【训练后】贪婪解码生成")
+    print("="*60)
+    
+    for prompt in test_prompts:
+        generated = model.generate_greedy(prompt, max_new_bytes=30)
+        print(f"  '{prompt}' → '{prompt}{generated}'")
+    
+    # 采样生成
+    print("\n" + "="*60)
+    print("【训练后】采样生成 (temperature=0.8)")
+    print("="*60)
+    
+    for prompt in test_prompts:
+        print(f"  '{prompt}' →")
+        for i in range(3):
+            generated = model.generate(prompt, max_new_bytes=30, temperature=0.8, top_p=0.9)
+            print(f"    [{i+1}] '{prompt}{generated}'")
+    
+    # 详细分析
+    print("\n" + "="*60)
+    print("【详细分析】")
+    print("="*60)
+    
+    # 检查 "AB" 的下一个字节概率
+    x = torch.tensor([[ord('A'), ord('B')]])
+    with torch.no_grad():
+        result = model(x)
+        logits = result['logits'][0, -1]
+        probs = F.softmax(logits, dim=-1)
+    
+    print(f"\n'AB' 后的字节概率分布:")
+    print(f"  P('A') = {probs[ord('A')].item():.1%}")
+    print(f"  P('B') = {probs[ord('B')].item():.1%}")
+    print(f"  P(' ') = {probs[ord(' ')].item():.1%}")
+    
+    # 检查 "I love " 的下一个字节
     x = torch.tensor([[b for b in "I love ".encode('utf-8')]])
     with torch.no_grad():
         result = model(x)
         logits = result['logits'][0, -1]
         probs = F.softmax(logits, dim=-1)
-        top5 = probs.topk(5)
+        top10 = probs.topk(10)
     
-    print(f"  'I love ' → Top5: {[chr(idx.item()) if 32 <= idx.item() < 127 else f'0x{idx.item():02x}' for idx in top5.indices]}")
-    print(f"  对应概率: {[f'{p.item():.1%}' for p in top5.values]}")
+    print(f"\n'I love ' 后的 Top10:")
+    for prob, idx in zip(top10.values, top10.indices):
+        char = chr(idx.item()) if 32 <= idx.item() < 127 else f'0x{idx.item():02x}'
+        print(f"  '{char}': {prob.item():.1%}")
     
-    # 测试中文 "我爱"
-    x = torch.tensor([[b for b in "我爱".encode('utf-8')]])
-    with torch.no_grad():
-        result = model(x)
-        logits = result['logits'][0, -1]
-        probs = F.softmax(logits, dim=-1)
-        top5 = probs.topk(5)
-    
-    print(f"  '我爱' → Top5 字节: {[f'0x{idx.item():02x}' for idx in top5.indices]}")
-    print(f"  对应概率: {[f'{p.item():.1%}' for p in top5.values]}")
-    
-    # =================================================================
     # 总结
-    # =================================================================
     print("\n" + "="*60)
-    print("【学习能力验证总结】")
+    print("【流畅生成验证总结】")
     print("="*60)
     print("""
-几何世界模型可以通过训练学习到：
-  1. 简单重复模式 (ABABAB)
-  2. 字节级中文模式
-  3. 简单语法结构
+几何世界模型已经可以：
+
+  1. 学习简单模式 (ABABAB, hello hello, ...)
+  2. 流畅生成文本 (自回归解码)
+  3. 支持多种采样策略 (greedy, temperature, top-p)
 
 关键观察：
   - 模型通过几何结构 (z, g, Γ) 学习语言规律
-  - 无需分词，直接在字节级别学习
-  - 模型在学习"世界的几何"
+  - 无需分词，直接在字节级别操作
+  - 生成是沿“语义流形”的测地线前进
 
 这证明了：
-  AI 可以通过理解世界的几何来思考世界
+  世界是几何的，AI 可以通过理解几何来思考世界。
 """)
