@@ -135,27 +135,43 @@ def build_damping_matrix(N: np.ndarray, gamma: float = 0.1) -> np.ndarray:
 
 def build_stiffness_matrix(
     omega_local: np.ndarray,
-    L: np.ndarray,
-    beta: float = 1.0
+    L_func: np.ndarray = None,
+    L_struct: np.ndarray = None,
+    beta_func: float = 1.0,
+    beta_struct: float = 0.0
 ) -> np.ndarray:
     """
     构建刚度矩阵 K
     
-    K = diag(ω²) + β·L
+    K = diag(ω²) + β_func·L_func + β_struct·L_struct
     
     本体论：
     - diag(ω²): 本地恢复力（每个节点的本征频率）
-    - β·L: 图耦合力（节点间的弹簧连接）
+    - L_func: 功能性图耦合（后验，从数据）
+    - L_struct: 结构性图耦合（先验，从知识）
+    
+    当无先验知识时，beta_struct=0，回退为纯数据驱动
+    当有先验知识时，可学习 beta_* 的权重
     """
+    n = len(omega_local)
     omega_squared = (2 * np.pi * omega_local) ** 2
-    return np.diag(omega_squared) + beta * L
+    K = np.diag(omega_squared)
+    
+    if L_func is not None:
+        K = K + beta_func * L_func
+    
+    if L_struct is not None:
+        K = K + beta_struct * L_struct
+    
+    return K
 
 
 def build_world_dynamics(
     X: np.ndarray,
     dt: float,
-    A_structural: np.ndarray = None,
-    beta: float = 1.0,
+    L_struct: np.ndarray = None,
+    beta_func: float = 1.0,
+    beta_struct: float = 0.0,
     gamma: float = 0.1,
     mass_type: str = "identity"
 ) -> WorldDynamics:
@@ -163,15 +179,17 @@ def build_world_dynamics(
     构建完整的世界动力学系统
     
     N·ẍ + D·ẋ + K·x = F(t)
+    
+    本体论：
+    - L_func: 功能性图（后验，从数据协方差）
+    - L_struct: 结构性图（先验，从知识输入）
+    - K = diag(ω²) + β_func·L_func + β_struct·L_struct
     """
     # 1. 本地频率
     omega_local = estimate_local_frequencies(X, dt)
     
-    # 2. 图拉普拉斯
-    if A_structural is not None:
-        L = build_graph_laplacian(A=A_structural, graph_type="structural")
-    else:
-        L = build_graph_laplacian(X=X, graph_type="functional")
+    # 2. 功能性图（始终从数据构建）
+    L_func = build_graph_laplacian(X=X, graph_type="functional")
     
     # 3. 质量矩阵
     N_mat = build_mass_matrix(X, mass_type)
@@ -179,12 +197,12 @@ def build_world_dynamics(
     # 4. 阻尼矩阵
     D_mat = build_damping_matrix(N_mat, gamma)
     
-    # 5. 刚度矩阵
-    K_mat = build_stiffness_matrix(omega_local, L, beta)
+    # 5. 刚度矩阵（双图结构）
+    K_mat = build_stiffness_matrix(omega_local, L_func, L_struct, beta_func, beta_struct)
     
     return WorldDynamics(
-        N=N_mat, D=D_mat, K=K_mat, L=L,
-        omega_local=omega_local, beta=beta, gamma=gamma
+        N=N_mat, D=D_mat, K=K_mat, L=L_func,
+        omega_local=omega_local, beta=beta_func, gamma=gamma
     )
 
 
@@ -287,8 +305,13 @@ class WorldDynamicsLayer(nn.Module):
     
     核心方程: N·ẍ + D·ẋ + K·x = F(t)
     
+    本体论：
+    - K = diag(ω²) + β_func·L_func + β_struct·L_struct
+    - L_func: 功能性图（后验，从数据）
+    - L_struct: 结构性图（先验，可选）
+    
     可学习参数:
-    - beta: 图耦合强度
+    - beta_func, beta_struct: 图耦合强度
     - gamma: 阻尼系数
     - omega_local: 本地频率 (可选)
     """
@@ -296,15 +319,18 @@ class WorldDynamicsLayer(nn.Module):
     def __init__(
         self,
         n_channels: int,
-        beta_init: float = 1.0,
+        beta_func_init: float = 1.0,
+        beta_struct_init: float = 0.0,
         gamma_init: float = 0.1,
-        learnable_omega: bool = False
+        learnable_omega: bool = False,
+        L_struct: torch.Tensor = None
     ):
         super().__init__()
         self.n_channels = n_channels
         
         # 可学习参数
-        self.log_beta = nn.Parameter(torch.tensor(np.log(beta_init + 1e-6)))
+        self.log_beta_func = nn.Parameter(torch.tensor(np.log(beta_func_init + 1e-6)))
+        self.log_beta_struct = nn.Parameter(torch.tensor(np.log(beta_struct_init + 1e-6)))
         self.log_gamma = nn.Parameter(torch.tensor(np.log(gamma_init + 1e-6)))
         
         # 本地频率 (可选可学习)
@@ -312,12 +338,22 @@ class WorldDynamicsLayer(nn.Module):
         if learnable_omega:
             self.log_omega = nn.Parameter(torch.zeros(n_channels))
         
-        # 图拉普拉斯 (会在 forward 中更新)
-        self.register_buffer('L', torch.eye(n_channels))
+        # 功能性图 (会在 forward 中更新)
+        self.register_buffer('L_func', torch.eye(n_channels))
+        
+        # 结构性图 (先验输入，固定)
+        if L_struct is not None:
+            self.register_buffer('L_struct', L_struct)
+        else:
+            self.register_buffer('L_struct', torch.zeros(n_channels, n_channels))
     
     @property
-    def beta(self) -> torch.Tensor:
-        return torch.exp(self.log_beta)
+    def beta_func(self) -> torch.Tensor:
+        return torch.exp(self.log_beta_func)
+    
+    @property
+    def beta_struct(self) -> torch.Tensor:
+        return torch.exp(self.log_beta_struct)
     
     @property
     def gamma(self) -> torch.Tensor:
@@ -325,7 +361,7 @@ class WorldDynamicsLayer(nn.Module):
     
     def update_graph(self, X: torch.Tensor):
         """
-        从数据更新图拉普拉斯 (功能性图)
+        从数据更新功能性图拉普拉斯 L_func
         
         X: (batch, time, channels)
         """
@@ -343,14 +379,14 @@ class WorldDynamicsLayer(nn.Module):
         D_inv_sqrt = torch.diag(1.0 / torch.sqrt(D_vec))
         L = torch.eye(self.n_channels, device=X.device) - D_inv_sqrt @ A @ D_inv_sqrt
         
-        self.L = L
+        self.L_func = L
     
     def build_K(self, omega_local: torch.Tensor) -> torch.Tensor:
         """
-        构建刚度矩阵 K = diag(ω²) + β·L
+        构建刚度矩阵 K = diag(ω²) + β_func·L_func + β_struct·L_struct
         """
         omega_sq = (2 * np.pi * omega_local) ** 2
-        K = torch.diag(omega_sq) + self.beta * self.L
+        K = torch.diag(omega_sq) + self.beta_func * self.L_func + self.beta_struct * self.L_struct
         return K
     
     def build_N(self, X: torch.Tensor, mass_type: str = "identity") -> torch.Tensor:
@@ -431,10 +467,12 @@ class WorldDynamicsLayer(nn.Module):
             'K': K,
             'N': N,
             'D': D,
-            'L': self.L,
+            'L_func': self.L_func,
+            'L_struct': self.L_struct,
             'omega_local': omega_local,
             'freq_collective': freq_collective,
-            'beta': self.beta,
+            'beta_func': self.beta_func,
+            'beta_struct': self.beta_struct,
             'gamma': self.gamma
         }
         
